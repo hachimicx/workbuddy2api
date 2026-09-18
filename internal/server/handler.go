@@ -47,6 +47,10 @@ type Config struct {
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
+
+	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
+	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
+	AdminEnabled bool
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -103,6 +107,17 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
+	// 运维管理端点（默认关闭，config admin.enabled 开启后生效）。
+	// 路径用 {uid} 通配而非查询参数：uid 是账号身份，放进路径便于审计与直观。
+	// 条件注册而非 handler 内 404（设计 supplement §2.3）：未注册的路由对未鉴权
+	// 探测回 mux 默认纯文本 404、对 GET 探测无 405+Allow 头，与真 404 完全不可
+	// 区分——路由一旦注册，"带 key 得 401 / GET 得 405 / JSON 信封 404" 三者都会
+	// 暴露管理面存在。
+	if cfg.AdminEnabled {
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
+	}
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
 }
@@ -497,15 +512,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 提取与下方会话头族的聚合键共用同一结果，故**不受粘性开关影响**：粘性未启用
 	// （Session==nil）时聚合键仍应是会话级，而不是退化成轮级。
 	sessKey := session.ExtractKey(body)
+	// stickyKey 是**粘性专用**键，与 sessKey（会话头族聚合用）分开：
+	// sessKey 为空时（OpenAI 兼容客户端——dsh / Codex 等既无 conversationId 也无
+	// metadata）用首条 user 消息派生会话级 fallback 键，使粘性仍能生效。
+	// 不能直接改 sessKey：那会连带改变上游头族 RequestIDForKey 的聚合语义
+	// （会话级 vs 轮级兜底），属于另一条链路的契约。
+	stickyKey := sessKey
+	if stickyKey == "" {
+		stickyKey = session.StickyFallbackKey(body)
+	}
 	stickyUID := ""
-	if h.cfg.Session != nil && sessKey != "" {
+	if h.cfg.Session != nil && stickyKey != "" {
 		// 传给 ResolveForModel 的是**完整**模型名（peek.Model，含 realm 前缀）。
 		// 粘性命中校验走 injected AvailableForModel 闭包 → 闭包内部 resolveModel 剥前缀
 		// 得 realm+bare，再按 realm 过滤可用集合。若传已剥前缀的 bareModel，闭包对裸名
 		// 恒剥出 realm=cn，跨 realm 粘性会话会被错误钉回 CN 集合；完整前缀才能让
 		// 闭包正确过滤到 global 集合（见 cmd/server/wiring.go realmAwareAvailableForModel）。
 		// 模型名也参与成本账本与选号过滤，不能用 "-" 占位污染模型键。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
+		if uid, ok := h.cfg.Session.ResolveForModel(stickyKey, peek.Model); ok {
 			stickyUID = uid
 		}
 	}
@@ -541,7 +565,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 	unbindSticky := func() {
 		if stickyUID != "" {
-			h.cfg.Session.Unbind(sessKey)
+			h.cfg.Session.Unbind(stickyKey)
 			stickyUID = ""
 		}
 	}
@@ -775,8 +799,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+		if stickyKey != "" && h.cfg.Session != nil {
+			h.cfg.Session.Bind(stickyKey, acct.UID)
 		}
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。

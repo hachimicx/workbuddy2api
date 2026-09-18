@@ -726,3 +726,27 @@ func TestRunKeepaliveBackfillsRealm(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckinPathIncludesManualDisabled 手动停用号必须仍参与签到（issue #138
+// 用户硬约束：停用只是对话流量摘除，签到/保活照常）。scheduler 判据只看
+// st.Disabled——本锚防未来有人把判据改成「 Disabled || ManualDisabled 」时
+// 无声破坏停用号的积分与 token 活性（审查改造点 4 的 scheduler 回归锚）。
+func TestCheckinPathIncludesManualDisabled(t *testing.T) {
+	stub := &checkinStub{checkinBody: `{"code":0,"msg":"ok","data":{}}`, resourceRemain: 500}
+	s, p := newCheckinS(t, stub)
+	p.SetManualDisabled("u1", true, "观察几天")
+
+	out, err := s.CheckinAll()
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(out) != 1 || out[0].Status != CheckinOK {
+		t.Fatalf("手动停用号应照常签到, out=%+v", out)
+	}
+	if stub.refreshCalls.Load() != 0 {
+		t.Errorf("token 未到期不应触发预刷新, calls=%d", stub.refreshCalls.Load())
+	}
+	if st, _ := p.Status("u1"); !st.ManualDisabled || st.Credits != 500 {
+		t.Fatalf("签到后应保留手动位且回填余额: %+v", st)
+	}
+}
