@@ -27,9 +27,11 @@ on:
   push:
     branches: [master]
 
-# 与 build.yml 共用同一组：避免两个 workflow 同时把 :latest 推成不同 commit
+# 本 workflow 自身串行（同一时刻只有一个 sync+build 在跑），避免两个 run 把 :latest 推成
+# 不同 commit。注意 build.yml 没有声明同名 concurrency 组，两者之间不互斥：它只在 04:23
+# 与打 tag 时跑（各约 4~7 分钟），与本文件的 01/07/13/19:17 基本不重叠。
 concurrency:
-  group: wb2api-image-publish
+  group: wb2api-sync-upstream
   cancel-in-progress: false
 
 permissions:
