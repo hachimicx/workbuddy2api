@@ -41,6 +41,10 @@ type cfgFile struct {
 	Schedule  config.Schedule   `json:"schedule"`
 	Upstream  struct {
 		TimeoutSeconds int `json:"timeout_seconds"`
+		// Proxy / NoProxy 出站代理（与网关 config upstream.proxy / no_proxy 同源同语义）；
+		// 空 = 直连。环境变量 WB2A_PROXY / WB2A_NO_PROXY 在缺省时兼容（见 newUpstream）。
+		Proxy   string `json:"proxy"`
+		NoProxy string `json:"no_proxy"`
 	} `json:"upstream"`
 }
 
@@ -119,6 +123,19 @@ func newUpstream(c *cfgFile) *upstream.Client {
 	up.GlobalEnabled = true
 	if c.Upstream.TimeoutSeconds > 0 {
 		up.HTTP.Timeout = time.Duration(c.Upstream.TimeoutSeconds) * time.Second
+	}
+	// 出站代理：config upstream.proxy 优先，缺省时回落环境变量（WB2A_PROXY /
+	// WB2A_NO_PROXY）——一次性工具不强制写 config。配置非法时告警后直连，
+	// 不中断上报（与 signin/credit/trial 同口径）。
+	proxyURL, noProxy := c.Upstream.Proxy, c.Upstream.NoProxy
+	if proxyURL == "" {
+		proxyURL = os.Getenv("WB2A_PROXY")
+	}
+	if noProxy == "" {
+		noProxy = os.Getenv("WB2A_NO_PROXY")
+	}
+	if err := up.SetProxy(proxyURL, noProxy); err != nil {
+		log.Printf("WARN: 出站代理配置无效，已回落直连: %v", err)
 	}
 	return up
 }

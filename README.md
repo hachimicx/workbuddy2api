@@ -73,6 +73,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
   - `prompt.file`（custom/append 生效）指向自定义提示词文件，空 = 内置默认
 - **会话头族注入** — 出站携带官方客户端会话头族（`X-Conversation-Request-ID` 聚合主键 · `X-Conversation-ID` 透传 · B3 链路），轮转 / 重试 / 路径回退复用同键，后台按对话轮聚合不再碎片化（issue #35）
 - **指纹脱敏** — 出站请求体黑名单指纹字段清洗（可开关），与提示词体系两层叠加
+- **出站代理** — `upstream.proxy`（或 `WB2A_PROXY`）把全部出站请求交给 HTTP/HTTPS/SOCKS5 代理：网关的聊天 SSE 与短 RPC（refresh / 签到 / 余额 / 模型列表 / models.dev）、Upstash Redis 镜像连接、`login.sh` 登录链路、以及调度器拉起的 python 脚本子进程（开学季 / 夜猫子）。`upstream.no_proxy` 按 `NO_PROXY` 语义排除内网/本地目标。域名一律**交代理远端解析**，本地不发 DNS。缺省**直连**且不读 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量——要环境变量行为就显式配置
 
 ### 选号语义
 
@@ -242,6 +243,44 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
+
+### 出站代理
+
+上游不可直连时（境外部署 / 受限网络 / 需要固定出口 IP），把全部出站请求交给本地代理：
+
+```json
+{
+  "upstream": {
+    "proxy": "socks5h://127.0.0.1:1080",
+    "no_proxy": "localhost,127.0.0.1,.internal.example"
+  }
+}
+```
+
+或只给环境变量（Docker Compose 的 `environment:` 段、Windows `start-workbuddy2api.cmd` 前置 `set`）：
+
+```bash
+WB2A_PROXY=socks5h://127.0.0.1:1080
+WB2A_NO_PROXY=localhost,127.0.0.1,.internal.example
+```
+
+- `proxy` 支持 `http` / `https` / `socks5` / `socks5h`（省略 scheme 按 `http`，省略端口按 scheme 默认）；凭据写成 `user:pass@host:port`，日志只打脱敏后的 `user:xxxxx@host:port`
+- `socks5h` 与 `socks5` 等价：**域名交代理远端解析**，本地不发 DNS（受限网络下避免解析泄漏与污染）
+- `no_proxy` 语义与 Go 标准库 `NO_PROXY` 逐条对齐：`example.com`（含子域）、`.example.com`（仅子域）、`*.example.com`、IP、CIDR、`host:port`、`*`
+- 生效范围：
+
+  | 出站路径 | 接线方式 |
+  | --- | --- |
+  | 聊天 SSE / token 刷新 / 签到 / 余额 / 模型列表 | 共享出站 Transport 的 Proxy 钩子 |
+  | models.dev 目录拉取 | 同上（同一个 Transport） |
+  | Upstash Redis 镜像连接 | `redis.Client.Dialer`（socks5 拨号器 / 自建 CONNECT 隧道） |
+  | `login.sh` 登录 + 内联签到 | 脚本把 config/`WB2A_PROXY` 归一为 `WB2A_PROXY` + `HTTP_PROXY`/`HTTPS_PROXY`（前者给 login 二进制，后者给内联 python） |
+  | 开学季 / 夜猫子 python 脚本 | 调度器下发 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 给子进程 |
+
+- **域名交代理远端解析**：http/https 走 CONNECT 的 authority、socks5 走 FQDN 地址类型，本地不发 DNS（受限网络下避免解析污染，也不让解析请求本身成为泄漏面）
+- **config 与 env 二选一即可**：配 `config.json` 的 `upstream.proxy` 就是唯一真相源（网关、Redis、`login.sh`、python 脚本子进程全部跟随）；`WB2A_PROXY` 仅在需要临时覆盖时用，优先级高于 config
+- **缺省直连，且不读 `HTTP_PROXY` / `HTTPS_PROXY`**：容器里残留的环境变量不会意外改道出站流量；要环境变量行为就显式配 `WB2A_PROXY`
+- 非法 URL / 非法 `no_proxy` 在**启动期**报错（fail fast），不会变成「每个请求都失败」；一次性工具（`signin` / `credit` / `trial` / `activity`）读同一组环境变量，配置非法时告警后直连
 
 ## 安全与合规
 

@@ -11,6 +11,7 @@ package redisstore
 import (
 	"context"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -54,7 +55,11 @@ const (
 //   - url 为空 → Noop（纯内存模式）
 //   - url 已是完整 rediss:// URL 则直接 ParseURL；否则用 token 组装 rediss://default:token@host:6379
 //   - Ping 失败 → Noop + 启动警告（硬性降级要求：不因 Redis 不可用而失败）
-func New(url, token string) Store {
+//
+// dialer 为可选出站拨号器（nil = 直连）：网关把 upstream.proxy 一并接给 Redis，
+// 否则配置了代理也会有一条走直连的 TLS 连接（Upstash 域名本地解析 + 直接连网，
+// 在受限网络下既是泄漏面也是单点失败源）。dialer 在 Ping 前装配，故连接期即生效。
+func New(url, token string, dialer func(ctx context.Context, network, addr string) (net.Conn, error)) Store {
 	if url == "" {
 		log.Printf("[redisstore] upstash 未配置，进入纯内存模式（Noop 降级）")
 		return Noop{}
@@ -68,6 +73,9 @@ func New(url, token string) Store {
 	}
 	opt.ReadTimeout = readTimeout
 	opt.WriteTimeout = readTimeout
+	if dialer != nil {
+		opt.Dialer = dialer
+	}
 	client := redis.NewClient(opt)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

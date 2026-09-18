@@ -31,6 +31,7 @@ import (
 	"time"
 
 	auth2 "workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 // 上游常量：CN → copilot.tencent.com（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
@@ -306,6 +307,32 @@ func buildLoginOutput(tok struct {
 	}
 }
 
+// newLoginClient 构造登录用 HTTP 客户端（独立 cookie jar，30s 总超时）。
+//
+// 出站代理：读 WB2A_PROXY / WB2A_NO_PROXY（与网关 config upstream.proxy 同一份语义）。
+// 登录阶段同样要访问 copilot.tencent.com / www.workbuddy.ai，上游不可直连时若这里
+// 漏配，就会出现「网关能跑、加账号必失败」的割裂；环境变量非法时告警后直连，
+// 不阻断登录（与 signin/credit/trial 同口径）。
+func newLoginClient(jar http.CookieJar) *http.Client {
+	c := &http.Client{Timeout: 30 * time.Second, Jar: jar}
+	proxyURL, noProxy := os.Getenv("WB2A_PROXY"), os.Getenv("WB2A_NO_PROXY")
+	if strings.TrimSpace(proxyURL) == "" {
+		return c // 缺省直连：不读 HTTP_PROXY/HTTPS_PROXY（与网关同一纪律）
+	}
+	fn, err := upstream.NewProxyFunc(proxyURL, noProxy)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: 出站代理配置无效，已回落直连: %v\n", err)
+		return c
+	}
+	tr := &http.Transport{
+		Proxy:               fn,
+		TLSHandshakeTimeout: 10 * time.Second,
+		ForceAttemptHTTP2:   true,
+	}
+	c.Transport = tr
+	return c
+}
+
 func main() {
 	realm, rest, err := parseRealmArgs(os.Args[1:])
 	if err != nil {
@@ -316,7 +343,7 @@ func main() {
 	}
 	// 每个流程独立 cookie jar（多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
-	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
+	client := newLoginClient(jar)
 
 	base, origin := realmConfig(realm)
 

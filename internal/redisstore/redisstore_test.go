@@ -1,7 +1,11 @@
 package redisstore
 
 import (
+	"context"
+	"errors"
+	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -36,14 +40,14 @@ func TestNormalizeURLStripsTrailingPath(t *testing.T) {
 }
 
 func TestNewEmptyURLReturnsNoop(t *testing.T) {
-	if _, ok := New("", "").(Noop); !ok {
+	if _, ok := New("", "", nil).(Noop); !ok {
 		t.Fatalf("empty url should return Noop")
 	}
 }
 
 func TestNewBadSchemeReturnsNoop(t *testing.T) {
 	// 组装出的连接串含空格 → ParseURL 解析失败 → 降级 Noop，不 panic、不发网络请求。
-	if _, ok := New("://bad host", "").(Noop); !ok {
+	if _, ok := New("://bad host", "", nil).(Noop); !ok {
 		t.Fatalf("bad url should return Noop")
 	}
 }
@@ -61,5 +65,24 @@ func TestNoopMethods(t *testing.T) {
 func TestBindKeyPrefix(t *testing.T) {
 	if got := bindKey("abc"); got != bindPrefix+"abc" {
 		t.Errorf("bindKey=%q want prefix", got)
+	}
+}
+
+// TestNewWiresDialer 出站代理接线：dialer 必须装配到 redis Options（否则配了代理也会
+// 有一条直连 Upstash 的 TLS 连接——既是泄漏面也是单点失败源）。
+// 用一个「必然失败的 dialer」断言连接期真的走了它（Ping 失败 → Noop 降级）。
+func TestNewWiresDialer(t *testing.T) {
+	var called int32
+	dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		atomic.AddInt32(&called, 1)
+		return nil, errors.New("dialer called (expected)")
+	}
+	// 域名不可解析也无妨：dialer 若被调用就直接报错，不落到真实网络。
+	got := New("https://wiring-test.upstash.io", "t", dialer)
+	if _, ok := got.(Noop); !ok {
+		t.Fatalf("ping failure should degrade to Noop, got %T", got)
+	}
+	if atomic.LoadInt32(&called) == 0 {
+		t.Error("dialer must be wired into redis options (never called)")
 	}
 }

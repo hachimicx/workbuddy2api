@@ -17,12 +17,14 @@ type fakeScriptExec struct {
 	lastName string
 	lastArgs []string
 	lastDir  string
+	lastEnv  []string
 	runN     int
 	err      error
 }
 
-func (f *fakeScriptExec) SetDir(dir string) { f.lastDir = dir }
-func (f *fakeScriptExec) Run() error        { f.runN++; return f.err }
+func (f *fakeScriptExec) SetDir(dir string)   { f.lastDir = dir }
+func (f *fakeScriptExec) SetEnv(env []string) { f.lastEnv = env }
+func (f *fakeScriptExec) Run() error          { f.runN++; return f.err }
 
 // installFakeExec 替换 newScriptCmd，测试结束还原。
 func installFakeExec(t *testing.T) *fakeScriptExec {
@@ -199,5 +201,111 @@ func TestPythonCmd(t *testing.T) {
 	t.Setenv("WB2A_PYTHON", "  /usr/bin/python3.10  ")
 	if got := pythonCmd(); got != "/usr/bin/python3.10" {
 		t.Errorf("trim pythonCmd()=%q want /usr/bin/python3.10", got)
+	}
+}
+
+// TestProxyEnv 子进程代理下发：WB2A_PROXY 非空 → HTTP_PROXY/HTTPS_PROXY(/NO_PROXY)
+// 追加到子进程环境；未设置 → environ 原样返回（零行为变更，不覆盖用户既有 HTTP_PROXY）。
+func TestProxyEnv(t *testing.T) {
+	base := []string{"PATH=/bin", "HTTP_PROXY=http://user-set:1"}
+
+	t.Setenv("WB2A_PROXY", "")
+	t.Setenv("WB2A_NO_PROXY", "localhost")
+	if got := proxyEnv(base); len(got) != len(base) {
+		t.Errorf("WB2A_PROXY unset must leave environ untouched, got %v", got)
+	}
+
+	t.Setenv("WB2A_PROXY", "socks5h://127.0.0.1:1080")
+	t.Setenv("WB2A_NO_PROXY", "localhost,.corp.example")
+	got := proxyEnv(base)
+	// 原有条目保留（exec 取最后一个同名键，故不需要先过滤）。
+	if len(got) != len(base)+3 {
+		t.Fatalf("env len=%d want %d: %v", len(got), len(base)+3, got)
+	}
+	if got[0] != "PATH=/bin" || got[1] != "HTTP_PROXY=http://user-set:1" {
+		t.Errorf("original env must be preserved: %v", got[:2])
+	}
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{
+		"HTTP_PROXY=socks5h://127.0.0.1:1080",
+		"HTTPS_PROXY=socks5h://127.0.0.1:1080",
+		"NO_PROXY=localhost,.corp.example",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("env missing %q: %v", want, got)
+		}
+	}
+
+	// NO_PROXY 为空则不下发该键（只下发两个代理变量）。
+	t.Setenv("WB2A_NO_PROXY", "")
+	if got := proxyEnv(base); len(got) != len(base)+2 {
+		t.Errorf("empty WB2A_NO_PROXY must not emit NO_PROXY: %v", got)
+	}
+}
+
+// TestRunScriptSetsProxyEnv 接线验证：runScript 真的把 proxyEnv 结果交给子进程
+// （proxyEnv 本身正确但没接线，等于没修）。
+func TestRunScriptSetsProxyEnv(t *testing.T) {
+	f := installFakeExec(t)
+	t.Setenv("WB2A_PROXY", "127.0.0.1:7890")
+	runScript("school", "/tmp", [][]string{{"python3", "scripts/x.py"}})
+	if f.runN != 1 {
+		t.Fatalf("runN=%d want 1", f.runN)
+	}
+	if !strings.Contains(strings.Join(f.lastEnv, "\n"), "HTTP_PROXY=127.0.0.1:7890") {
+		t.Errorf("script subprocess env must carry the proxy: %v", f.lastEnv)
+	}
+}
+
+// TestEffectiveProxyPriority 生效代理的优先级：WB2A_PROXY（显式 env）> config 注入。
+func TestEffectiveProxyPriority(t *testing.T) {
+	t.Cleanup(func() { SetScriptProxy("", "") })
+	t.Setenv("WB2A_PROXY", "")
+	t.Setenv("WB2A_NO_PROXY", "")
+
+	// 1. 都未配置 → 空（不下发，零行为变更）。
+	if p, n := effectiveProxy(); p != "" || n != "" {
+		t.Errorf("nothing configured: (%q,%q) want empty", p, n)
+	}
+
+	// 2. 只有 config → 用 config 值。
+	SetScriptProxy("socks5h://127.0.0.1:1080", "localhost")
+	if p, n := effectiveProxy(); p != "socks5h://127.0.0.1:1080" || n != "localhost" {
+		t.Errorf("config only: (%q,%q)", p, n)
+	}
+
+	// 3. env 覆盖 config（与网关其余部分「显式 env > config」一致）。
+	t.Setenv("WB2A_PROXY", "http://127.0.0.1:7890")
+	t.Setenv("WB2A_NO_PROXY", ".corp.example")
+	if p, n := effectiveProxy(); p != "http://127.0.0.1:7890" || n != ".corp.example" {
+		t.Errorf("env must win over config: (%q,%q)", p, n)
+	}
+
+	// 4. env 只设 proxy、config 设 no_proxy → 各自独立回落，不互相清空。
+	t.Setenv("WB2A_NO_PROXY", "")
+	if p, n := effectiveProxy(); p != "http://127.0.0.1:7890" || n != "localhost" {
+		t.Errorf("per-field fallback: (%q,%q) want env proxy + config no_proxy", p, n)
+	}
+}
+
+// TestProxyEnvFromConfigOnly config 配了代理、env 没配时，脚本子进程也必须拿到代理
+// ——这是「config 作为唯一真相源」的回归锁（此前只有 env 路径能下发）。
+func TestProxyEnvFromConfigOnly(t *testing.T) {
+	t.Cleanup(func() { SetScriptProxy("", "") })
+	t.Setenv("WB2A_PROXY", "")
+	t.Setenv("WB2A_NO_PROXY", "")
+	SetScriptProxy("socks5h://127.0.0.1:1080", "localhost")
+
+	f := installFakeExec(t)
+	runScript("school", "/tmp", [][]string{{"python3", "scripts/x.py"}})
+	joined := strings.Join(f.lastEnv, "\n")
+	for _, want := range []string{
+		"HTTP_PROXY=socks5h://127.0.0.1:1080",
+		"HTTPS_PROXY=socks5h://127.0.0.1:1080",
+		"NO_PROXY=localhost",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("config-only proxy must reach the subprocess, missing %q: %v", want, f.lastEnv)
+		}
 	}
 }

@@ -51,6 +51,14 @@ type Config struct {
 	SchoolDisabled bool
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
+
+	// ProxyURL / NoProxy 出站代理（config upstream.proxy / no_proxy）。
+	// 仅用于给脚本类任务的子进程下发 HTTP_PROXY/HTTPS_PROXY/NO_PROXY：
+	// python 脚本自己用 urllib 出网，**不读** Go 侧 Transport 配置——不下发就会
+	// 绕过代理直连（上游不可直连的网络里表现为任务必失败 + 一条直连路径）。
+	// 空 = 不下发（子进程继承既有环境，行为与改动前逐字一致）。
+	ProxyURL string
+	NoProxy  string
 }
 
 // Scheduler 调度器。
@@ -98,7 +106,6 @@ func New(cfg Config) *Scheduler {
 	}
 	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string), rewardClaimed: make(map[string]string)}
 }
-
 // checkinRefreshSkew 签到前判定"token 是否临近过期"的时间窗口（10 分钟）。
 // 长时间停机/容器长期停跑后 access token 往往已过期，不先刷新则签到必然 401 白跑。
 const checkinRefreshSkew = 10 * time.Minute

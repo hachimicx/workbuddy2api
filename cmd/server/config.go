@@ -4,6 +4,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -11,6 +13,7 @@ import (
 
 	"workbuddy2api/internal/config"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/upstream"
 )
 
 // Config 顶层配置。
@@ -83,6 +86,18 @@ type Config struct {
 		// PassthroughIP 是否透传客户端 IP（X-Forwarded-For/X-Real-IP 首段）给上游。
 		// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）；true 才透传。
 		PassthroughIP bool `json:"passthrough_ip"`
+
+		// Proxy 出站代理 URL（空 = 直连，且**不读** HTTP_PROXY/HTTPS_PROXY 环境变量）。
+		// 支持 http / https / socks5 / socks5h，省略 scheme 按 http、省略端口按 scheme 默认。
+		// 覆盖全部出站路径（聊天 SSE + 短 RPC + models.dev），凭据可写 user:pass@host:port。
+		Proxy string `json:"proxy"`
+		// NoProxy 代理绕过清单（逗号分隔）：域名（含子域）/ .域名 / IP / CIDR /
+		// host:port / "*"。语义与 net/http 的 NO_PROXY 逐条对齐；仅 proxy 非空时有意义。
+		NoProxy string `json:"no_proxy"`
+
+		// ProxyFunc 解析后的出站代理钩子（nil = 直连）。normalize 期构造并校验
+		// （URL / no_proxy 非法直接启动报错），main 把它挂到出站 Transport 上。
+		ProxyFunc func(*http.Request) (*url.URL, error) `json:"-"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -273,6 +288,12 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_CLI_VERSION"); v != "" {
 		c.Upstream.CliVersion = v
 	}
+	if v := os.Getenv("WB2A_PROXY"); v != "" {
+		c.Upstream.Proxy = v
+	}
+	if v := os.Getenv("WB2A_NO_PROXY"); v != "" {
+		c.Upstream.NoProxy = v
+	}
 	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Upstream.PassthroughIP = b
@@ -379,6 +400,11 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	// 出站代理：空 = 直连（ProxyFunc 保持 nil）。非空则在此构造钩子并校验
+	// URL/no_proxy（fail fast：非法配置在启动期报错，而不是每个请求都失败）。
+	if c.Upstream.ProxyFunc, err = upstream.NewProxyFunc(c.Upstream.Proxy, c.Upstream.NoProxy); err != nil {
+		return err
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen

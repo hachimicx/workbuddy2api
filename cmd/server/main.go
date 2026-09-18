@@ -63,7 +63,13 @@ func main() {
 	upstream.SetModelCatalogPath(modelJSONPath(cfg.StateFile))
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
-	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
+	// 出站代理一并接给 Redis：配了 upstream.proxy 就不该再有一条直连外网的 TLS 连接
+	// （见 upstream.NewProxyDialer 与 redisstore.New 的 dialer 参数）。
+	storeDialer, err := upstream.NewProxyDialer(cfg.Upstream.Proxy)
+	if err != nil {
+		log.Fatalf("build proxy dialer: %v", err)
+	}
+	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token, storeDialer)
 
 	p := pool.New(cfg.StateFile)
 	defer p.Close() // 进程退出前停后台落盘 goroutine + 最后补一次落盘（FIX-4:goroutine 泄漏）
@@ -138,6 +144,17 @@ func main() {
 	// 用量归属头（X-Product/X-IDE-*）+ 客户端 IP 透传开关（见 ChatHeaders / handler）。
 	up.ClientName = cfg.Upstream.ClientName
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// 出站代理（config upstream.proxy / no_proxy，或 WB2A_PROXY / WB2A_NO_PROXY）：
+	// 覆盖聊天 SSE + 短 RPC + models.dev 全部出站路径；空 = 直连。钩子在
+	// Load→normalize 已解析校验（非法配置在启动前就报错），此处只挂到 Transport。
+	if cfg.Upstream.ProxyFunc != nil {
+		tr, ok := up.HTTP.Transport.(*http.Transport)
+		if !ok {
+			log.Fatalf("outbound transport type %T does not support proxy", up.HTTP.Transport)
+		}
+		tr.Proxy = cfg.Upstream.ProxyFunc
+		log.Printf("出站代理已启用：%s（no_proxy=%q）", upstream.MaskProxyURL(cfg.Upstream.Proxy), cfg.Upstream.NoProxy)
+	}
 	// global realm 双域路由（config global 段）：base 空回落内置默认 https://www.workbuddy.ai；
 	// GlobalEnabled 与 auth 包开关一致（双保险第二道闸在 upstream.globalOn）。
 	up.ChatBaseGlobal = cfg.Global.ChatBase
@@ -155,12 +172,15 @@ func main() {
 		CatHours:            cfg.Schedule.CatHours,
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
-		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:      !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
-		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
-		CatDisabled:         !cfg.Schedule.CatEnabled,
+		// 脚本子进程代理下发（python urllib 自出网，不读 Go 侧配置）。
+		ProxyURL:          cfg.Upstream.Proxy,
+		NoProxy:           cfg.Upstream.NoProxy,
+		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:    !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:  !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
+		SchoolDisabled:    !cfg.Schedule.SchoolEnabled,
+		CatDisabled:       !cfg.Schedule.CatEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:

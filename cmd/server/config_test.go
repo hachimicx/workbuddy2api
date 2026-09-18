@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -747,5 +748,80 @@ func TestPromptInvalidModeStillErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "custom / append / passthrough") {
 		t.Errorf("error should mention (custom / append / passthrough): %v", err)
+	}
+}
+
+// TestUpstreamProxyDefaultDirect 缺省直连：不配 upstream.proxy 时 ProxyFunc 为 nil
+// （出站 Transport.Proxy 保持 nil → 不读 HTTP_PROXY/HTTPS_PROXY 环境变量）。
+func TestUpstreamProxyDefaultDirect(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Upstream.Proxy != "" || c.Upstream.ProxyFunc != nil {
+		t.Errorf("default proxy=%q func!=nil=%v want empty/nil", c.Upstream.Proxy, c.Upstream.ProxyFunc != nil)
+	}
+}
+
+// TestUpstreamProxyFromFile config upstream.proxy / no_proxy 解析 + 钩子生效。
+func TestUpstreamProxyFromFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"proxy":"socks5h://127.0.0.1:1080","no_proxy":"localhost,.corp.example"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Upstream.ProxyFunc == nil {
+		t.Fatal("ProxyFunc must be built when upstream.proxy is set")
+	}
+	// 走代理：非绕过目标返回代理 URL。
+	req, _ := http.NewRequest("POST", "https://copilot.tencent.com/v2/chat/completions", nil)
+	u, err := c.Upstream.ProxyFunc(req)
+	if err != nil || u == nil || u.Host != "127.0.0.1:1080" {
+		t.Fatalf("proxy for upstream host = %v, %v", u, err)
+	}
+	// no_proxy 命中 → 直连（nil URL）。
+	bypassReq, _ := http.NewRequest("GET", "https://app.corp.example/x", nil)
+	if u, err := c.Upstream.ProxyFunc(bypassReq); err != nil || u != nil {
+		t.Errorf("bypassed host = %v, %v want nil,nil", u, err)
+	}
+}
+
+// TestUpstreamProxyEnvOverride WB2A_PROXY / WB2A_NO_PROXY 环境变量覆盖（Docker 部署主入口）。
+func TestUpstreamProxyEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_PROXY", "127.0.0.1:7890")
+	t.Setenv("WB2A_NO_PROXY", "example.com")
+	c, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Upstream.Proxy != "127.0.0.1:7890" || c.Upstream.NoProxy != "example.com" {
+		t.Fatalf("proxy=%q no_proxy=%q want env values", c.Upstream.Proxy, c.Upstream.NoProxy)
+	}
+	if c.Upstream.ProxyFunc == nil {
+		t.Fatal("ProxyFunc must be built from env proxy")
+	}
+	req, _ := http.NewRequest("GET", "https://copilot.tencent.com/x", nil)
+	if u, _ := c.Upstream.ProxyFunc(req); u == nil || u.Scheme != "http" || u.Host != "127.0.0.1:7890" {
+		t.Errorf("proxy=%v want http://127.0.0.1:7890 (scheme defaulted)", u)
+	}
+}
+
+// TestUpstreamProxyInvalidFailsFast 非法 proxy / no_proxy 在启动期报错（fail fast）。
+func TestUpstreamProxyInvalidFailsFast(t *testing.T) {
+	cases := []string{
+		`{"upstream":{"proxy":"ftp://127.0.0.1:21"}}`,
+		`{"upstream":{"proxy":"http://"}}`,
+		`{"upstream":{"proxy":"http://127.0.0.1:7890","no_proxy":"example.com:abc"}}`,
+		`{"upstream":{"proxy":"http://127.0.0.1:7890","no_proxy":"10.0.0.0/33"}}`,
+	}
+	for _, body := range cases {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(body), 0o600)
+		if _, err := Load(fp); err == nil {
+			t.Errorf("Load(%s) want error", body)
+		}
 	}
 }

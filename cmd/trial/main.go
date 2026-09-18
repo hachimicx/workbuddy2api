@@ -72,6 +72,11 @@ func main() {
 		os.Exit(1)
 	}
 	up := upstream.New()
+	// 出站代理：WB2A_PROXY / WB2A_NO_PROXY（与网关 config upstream.proxy 同一份语义）。
+	// 配置非法时打印警告后直连，不中断批量领取。
+	if err := up.SetProxyFromEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: 出站代理配置无效，已回落直连: %v\n", err)
+	}
 	// trial 是 global 专属端点：必须开启 global realm 路由，否则 upstream.New() 的
 	// GlobalEnabled 零值 false 会把请求路由到 CN base（codebuddy.cn）而必然失败。
 	up.GlobalEnabled = true

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"testing"
 
 	"workbuddy2api/internal/config"
@@ -27,5 +28,43 @@ func TestNewUpstreamAppliesTimeout(t *testing.T) {
 	}
 	if up.HTTP.Timeout.String() != "7s" {
 		t.Errorf("HTTP.Timeout=%v want 7s", up.HTTP.Timeout)
+	}
+}
+
+// TestNewUpstreamProxyWiring 出站代理接线：config upstream.proxy 优先，缺省回落
+// WB2A_PROXY 环境变量（一次性工具不强制写 config）；非法配置告警后直连不中断上报。
+func TestNewUpstreamProxyWiring(t *testing.T) {
+	// 1. config 显式配置生效。
+	c := &cfgFile{Schedule: config.DefaultSchedule()}
+	c.Upstream.Proxy = "127.0.0.1:7890"
+	c.Upstream.NoProxy = "localhost"
+	tr, ok := newUpstream(c).HTTP.Transport.(*http.Transport)
+	if !ok || tr.Proxy == nil {
+		t.Fatal("config upstream.proxy must be wired to Transport.Proxy")
+	}
+	req, _ := http.NewRequest("GET", "https://copilot.tencent.com/x", nil)
+	if u, _ := tr.Proxy(req); u == nil || u.Host != "127.0.0.1:7890" {
+		t.Errorf("proxy=%v want 127.0.0.1:7890", u)
+	}
+
+	// 2. config 缺省时回落 WB2A_PROXY 环境变量。
+	t.Setenv("WB2A_PROXY", "socks5h://127.0.0.1:1080")
+	tr2, _ := newUpstream(&cfgFile{Schedule: config.DefaultSchedule()}).HTTP.Transport.(*http.Transport)
+	if tr2.Proxy == nil {
+		t.Fatal("WB2A_PROXY env must be honored when config proxy is empty")
+	}
+
+	// 3. 非法配置：告警后直连（不 panic、不中断）。
+	t.Setenv("WB2A_PROXY", "ftp://127.0.0.1:21")
+	tr3, _ := newUpstream(&cfgFile{Schedule: config.DefaultSchedule()}).HTTP.Transport.(*http.Transport)
+	if tr3.Proxy != nil {
+		t.Error("invalid proxy must fall back to direct connection")
+	}
+
+	// 4. 都未配置：直连。
+	t.Setenv("WB2A_PROXY", "")
+	tr4, _ := newUpstream(&cfgFile{Schedule: config.DefaultSchedule()}).HTTP.Transport.(*http.Transport)
+	if tr4.Proxy != nil {
+		t.Error("no proxy configured must stay direct")
 	}
 }

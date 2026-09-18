@@ -20,6 +20,30 @@ cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
 
+# ─── 出站代理归一（config upstream.proxy / WB2A_PROXY → 环境变量）───
+# 本脚本的出网有三条路：login 二进制（读 WB2A_PROXY）、内联 python 的签到
+# （urllib 只认 HTTP_PROXY/HTTPS_PROXY/NO_PROXY）、以及可选的地图/trial 流程。
+# 只配 config 或只配 WB2A_PROXY 都会让另一条路径直连（上游不可直连时表现为
+# 「登录成功、签到必失败」）。这里把两者归一：config 读进 WB2A_PROXY，再展开为
+# 标准代理变量，让脚本内所有出网路径口径一致。
+# 优先级与网关一致（显式 env > config）；已设 HTTP_PROXY/HTTPS_PROXY 时以用户
+# 显式配置为准，不覆盖。python3 不存在时静默跳过（后续步骤本就需要 python3）。
+if [[ -z "${WB2A_PROXY:-}" && -f config.json ]]; then
+    WB2A_PROXY=$(python3 -c "import json;print((json.load(open('config.json')).get('upstream') or {}).get('proxy',''))" 2>/dev/null || true)
+fi
+if [[ -z "${WB2A_NO_PROXY:-}" && -f config.json ]]; then
+    WB2A_NO_PROXY=$(python3 -c "import json;print((json.load(open('config.json')).get('upstream') or {}).get('no_proxy',''))" 2>/dev/null || true)
+fi
+if [[ -n "${WB2A_PROXY:-}" ]]; then
+    # export 回去：login 二进制读的就是这个变量（config 值经此与 env 合流）。
+    export WB2A_PROXY
+    [[ -n "${WB2A_NO_PROXY:-}" ]] && export WB2A_NO_PROXY
+    export HTTP_PROXY="${HTTP_PROXY:-$WB2A_PROXY}"
+    export HTTPS_PROXY="${HTTPS_PROXY:-$WB2A_PROXY}"
+    [[ -n "${WB2A_NO_PROXY:-}" ]] && export NO_PROXY="${NO_PROXY:-$WB2A_NO_PROXY}"
+    echo "使用出站代理: $WB2A_PROXY"
+fi
+
 mkdir -p "$AUTH_DIR" 2>/dev/null || true
 # ─── auths/ 可写性预检（issue #160）：chown -R 10001 后 host 侧 uid 无写权限，
 #      此时走完整 OAuth 再在落盘处失败 = 白跑一次浏览器授权。OAuth 启动前 fail-fast。───

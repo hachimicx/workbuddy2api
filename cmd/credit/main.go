@@ -43,6 +43,11 @@ func main() {
 		authDir = v
 	}
 	up := upstream.New()
+	// 出站代理：WB2A_PROXY / WB2A_NO_PROXY（与网关 config upstream.proxy 同一份语义）。
+	// 配置非法时打印警告后直连，不中断查询。
+	if err := up.SetProxyFromEnv(); err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: 出站代理配置无效，已回落直连: %v\n", err)
+	}
 	up.GlobalEnabled = true // 允许按 realm 路由：global 账查积分走 workbuddy.ai
 	accounts := collect(authDir, up)
 	printAccounts(accounts, pretty)

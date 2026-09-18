@@ -38,6 +38,11 @@ func main() {
 		os.Exit(1)
 	}
 	up := upstream.New()
+	// 出站代理：WB2A_PROXY / WB2A_NO_PROXY（与网关 config upstream.proxy 同一份语义，
+	// 见 internal/upstream/proxy.go）。空 = 直连。配置非法时打印警告后直连，不中断批量任务。
+	if err := up.SetProxyFromEnv(); err != nil {
+		log.Printf("WARN: 出站代理配置无效，已回落直连: %v", err)
+	}
 	// 允许按 realm 路由：global 账号的签到/余额会打到 global base（workbuddy.ai），
 	// 由幂等码兜底为「未开启/不适用」，而不是误打到 CN base 产生签到成功的假象。
 	// 纯 CN 部署无 global 账号时此开关无影响（账号 realm 全 cn → 全走 CN base）。

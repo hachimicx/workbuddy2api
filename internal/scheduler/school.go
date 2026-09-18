@@ -41,15 +41,17 @@ func repoRoot() string {
 // scriptRunner 脚本子进程的最小执行面：可被测试替换，避免测试真正拉起 python3。
 type scriptRunner interface {
 	SetDir(string)
+	SetEnv([]string)
 	Run() error
 }
 
-// scriptCmd exec.Cmd 适配器：把 exec.Cmd 的 Dir 字段包装成 SetDir 方法，
+// scriptCmd exec.Cmd 适配器：把 exec.Cmd 的 Dir/Env 字段包装成方法，
 // 满足 scriptRunner 接口（exec.Cmd 本身只有字段没有方法）。
 type scriptCmd struct{ cmd *exec.Cmd }
 
-func (c *scriptCmd) SetDir(dir string) { c.cmd.Dir = dir }
-func (c *scriptCmd) Run() error        { return c.cmd.Run() }
+func (c *scriptCmd) SetDir(dir string)   { c.cmd.Dir = dir }
+func (c *scriptCmd) SetEnv(env []string) { c.cmd.Env = env }
+func (c *scriptCmd) Run() error          { return c.cmd.Run() }
 
 // newScriptCmd 构建脚本子进程。包级变量便于测试注入 fake（installFakeExec 覆盖）。
 // 工作目录由调用方 SetDir 显式设置仓库根。
@@ -76,10 +78,15 @@ func pythonCmd() string {
 
 // runScript 依次执行若干脚本命令：任一命令失败只记一行 WARN，不向上抛、
 // 不影响调度主循环继续跑下一个时点。单命令失败不中断后续命令。
+//
+// 子进程环境经 proxyEnv 处理：生效代理（WB2A_PROXY 或 config upstream.proxy）
+// 非空时下发 HTTP_PROXY/HTTPS_PROXY/NO_PROXY（python urllib 自出网，不读
+// Go 侧 Transport 配置——不下发就会绕过代理直连）。
 func runScript(name, root string, commands [][]string) {
 	for _, cmdArgs := range commands {
 		c := newScriptCmd(cmdArgs[0], cmdArgs[1:]...)
 		c.SetDir(root)
+		c.SetEnv(proxyEnv(os.Environ()))
 		if err := c.Run(); err != nil {
 			log.Printf("WARN: %s (%s): %v", name, cmdArgs[1], err)
 			continue
