@@ -1,0 +1,168 @@
+# sync-upstream.yml —— 跟踪上游 Sliverkiss/workbuddy2api，自动合并 + 构建镜像。
+#
+#   sync  : 拉上游 master，合并进本 fork 的 master 并推送（有冲突就失败报警，绝不硬来）
+#   build : 同步到新提交（或手动 / 推送到 master）时，构建 linux/amd64 + linux/arm64
+#           镜像推送到 ghcr.io/hachimicx/workbuddy2api
+#
+# 为什么 build 不单独一个 workflow：用 GITHUB_TOKEN 推送产生的 push 事件不会触发其它
+# workflow（GitHub 防递归），所以构建必须跟在 sync 后面同 workflow 跑。
+#
+# 已知约束（GITHUB_TOKEN 的结构性限制）：内置 GITHUB_TOKEN 被 GitHub 禁止创建/修改
+# .github/workflows/ 下的文件，任何 permissions: 都解不开；一旦合并里带进上游的
+# workflow 改动，整个 push 会被拒。因此默认策略是「同步上游代码，保留本 fork 的
+# workflow 文件」。若在仓库 Secrets 里加 SYNC_TOKEN（fine-grained PAT：
+# Contents 读写 + Workflows 读写），脚本会自动改用它，连上游 workflow 改动一起同步。
+name: Sync Upstream & Build
+
+on:
+  schedule:
+    # 每 6 小时。错开整点（schedule 在整点排队严重），也避开 build.yml 的 04:23。
+    - cron: '17 1,7,13,19 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: '上游引用（默认 master；可填分支/tag 做验证）'
+        required: false
+        default: master
+  push:
+    branches: [master]
+
+# 与 build.yml 共用同一组：避免两个 workflow 同时把 :latest 推成不同 commit
+concurrency:
+  group: wb2api-image-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      sha: ${{ steps.merge.outputs.sha }}
+      upstream_sha: ${{ steps.merge.outputs.upstream_sha }}
+    steps:
+      - name: Check out fork master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          # 有 SYNC_TOKEN 就用它（带 workflows 权限）；否则退回内置 GITHUB_TOKEN
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream into fork master
+        id: merge
+        env:
+          UPSTREAM_REPO: Sliverkiss/workbuddy2api
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'master' }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/${UPSTREAM_REPO}.git}"
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || true
+          git fetch --no-tags upstream "$UPSTREAM_REF"
+          UPSTREAM_SHA=$(git rev-parse FETCH_HEAD)
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "上游 ${UPSTREAM_SHA:0:7} 已包含在 HEAD 中，无需合并"
+            {
+              echo "changed=false"
+              echo "sha=$(git rev-parse HEAD)"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BEFORE=$(git rev-parse HEAD)
+          if ! git merge --no-ff \
+               -m "chore(sync): 合并上游 ${UPSTREAM_REPO}@${UPSTREAM_SHA:0:7} [skip ci]" \
+               "$UPSTREAM_SHA"; then
+            git merge --abort || true
+            echo "::error::合并上游 ${UPSTREAM_SHA:0:7} 冲突，已放弃合并，需人工处理"
+            exit 1
+          fi
+
+          # 没有 SYNC_TOKEN 时 GITHUB_TOKEN 推不动 .github/workflows/：
+          # 把这些文件还原成 fork 自己的版本，否则整个 push 会被 GitHub 拒绝。
+          if [ -z "${SYNC_TOKEN:-}" ]; then
+            mapfile -t WF < <(git diff --name-only "$BEFORE" HEAD -- .github/workflows)
+            if [ "${#WF[@]}" -gt 0 ]; then
+              echo "::warning::上游改了 workflow 文件，GITHUB_TOKEN 无权限推送，保留 fork 版本: ${WF[*]}"
+              for f in "${WF[@]}"; do
+                if git cat-file -e "$BEFORE:$f" 2>/dev/null; then
+                  git checkout "$BEFORE" -- "$f"
+                else
+                  git rm -q --ignore-unmatch "$f"
+                fi
+              done
+              git commit --amend --no-edit
+            fi
+          fi
+
+          if git diff --quiet "$BEFORE" HEAD; then
+            echo "合并后无实际代码改动（上游只动了 workflow 文件），不推送"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git push origin HEAD:master
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          {
+            echo "### 上游同步"
+            echo ""
+            echo "- 上游引用: \`${{ inputs.upstream_ref || 'master' }}\` @ \`${{ steps.merge.outputs.upstream_sha }}\`"
+            echo "- 是否产生新提交: \`${{ steps.merge.outputs.changed }}\`"
+            echo "- fork master: \`${{ steps.merge.outputs.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: sync
+    # schedule 且没同步到新东西 → 不用重建；手动触发 / 推到 master → 照常构建
+    if: needs.sync.outputs.changed == 'true' || github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out merged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Create config.json for build
+        run: cp config.example.json config.json
+
+      # setup-qemu 必须在 setup-buildx 之前：buildx 多架构依赖 QEMU 跨平台模拟。
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ghcr 镜像名必须全小写：github.repository 可能含大写，需转小写
+      - name: Compute image name (lowercase)
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push multi-arch
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:${{ needs.sync.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
