@@ -313,3 +313,29 @@ func TestChatSessionKeyBeatsTurnKey(t *testing.T) {
 		t.Errorf("会话键路径应跨轮稳定（不受末条 user 变化影响）: %q vs %q", a, b)
 	}
 }
+
+// TestChatImageTurnAggregation 纯图 body 两次经 /v1/chat/completions：出站
+// X-Conversation-Request-ID 同值（contentSignature 修复 G1——原为请求级随机
+// 碎片化；审计 §3.1 探针用例转正）。带文本的下一轮换键（跨轮不混并）。
+func TestChatImageTurnAggregation(t *testing.T) {
+	imgBody := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":[` +
+		`{"type":"image_url","image_url":{"url":"https://img.example/cat.png"}}]}]}`
+	first := turnRequestIDForBody(t, imgBody)
+	second := turnRequestIDForBody(t, imgBody)
+	if first == "" {
+		t.Fatal("纯图请求应派生轮级聚合 ID（G1：原请求级随机）")
+	}
+	if first != second {
+		t.Errorf("纯图同 body 两次出站应同聚合 ID: %q vs %q", first, second)
+	}
+	if !isValidB3Trace(first) {
+		t.Errorf("轮级 id %q want 32 hex", first)
+	}
+	// 跨轮：末条 user 换成文本 → 换键。
+	next := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"messages":[`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://img.example/cat.png"}}]},`+
+		`{"role":"assistant","content":"答"},{"role":"user","content":"继续"}]}`)
+	if next == "" || next == first {
+		t.Errorf("下一轮（末条 user 换文本）应换聚合键: first=%q next=%q", first, next)
+	}
+}

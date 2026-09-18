@@ -405,7 +405,9 @@ func hasUserID(body []byte) bool {
 	return strOrEmpty(obj["user_id"]) != ""
 }
 
-// firstUserText 取 body 里**首条** role=="user" 消息的文本（去首尾空白）；无则 ""。
+// firstUserText 取 body 里**首条** role=="user" 消息的内容签名（去首尾空白）；
+// 无则 ""。签名走 ids.go contentSignature：纯文本与旧 contentText 结果一致
+// （存量粘性键零漂移），纯图片轮可签名（首图会话的粘性盲区修复，G1）。
 func firstUserText(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -423,10 +425,10 @@ func firstUserText(body []byte) string {
 		if obj.Messages[i].Role != "user" {
 			continue
 		}
-		if text := strings.TrimSpace(contentText(obj.Messages[i].Content)); text != "" {
+		if text := strings.TrimSpace(contentSignature(obj.Messages[i].Content)); text != "" {
 			return text
 		}
-		// 首条 user 消息无文本（纯图片/多模态无文字等）→ 不继续往后找：往后找会让
+		// 首条 user 消息无可签名内容（空/null 等）→ 不继续往后找：往后找会让
 		// 键随会话推进而漂移（一旦某轮该位置带上文本），破坏"同会话恒同键"。
 		return ""
 	}

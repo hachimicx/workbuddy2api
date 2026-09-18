@@ -601,11 +601,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = rewriteModel(body, bareModel)
 	}
 
-	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID（对话轮级）聚合请求，
-	// 官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。此处**轮转
-	// 循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再
-	// 碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个
-	// RequestID）。
+	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID 聚合请求，官方客户端
+	// 一次 user send 内所有 tool call/重试/换号复用同一个 ID。**双形态并存**（均对齐
+	// 官方）：带 conversationId 的客户端为**会话级**（对齐官方云链路 lfConvReqId 的
+	// 服务端下发后复用形态，跨轮同键）；无会话键的客户端为**轮级**（对齐官方桌面
+	// CLI / 排队链路的 queueRequestId 形态，同轮内复用、换 user 消息换键）。此处
+	// **轮转循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，
+	// 后台不再碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十
+	// 上百个 RequestID）。
 	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造，见
 	//     ResolveConversationID；官方后台不校验一致，空会话则不建立聚合键）；
 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先（客户端已
