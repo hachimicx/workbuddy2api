@@ -190,7 +190,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # build.yml 里的 amd64 离线 tar.gz 不在这里重复：GITHUB_TOKEN 推送的 commit 不会触发
-      # 其它 workflow，所以合并提交之后 build.yml 不会自己跑。要离线包时，在 fork 上手动跑
-      # Actions → Build & Publish → Run workflow 即可（workflow_dispatch 会按当前 master 构建）。
+      # 这里的镜像只含多架构镜像推送。build.yml 那边另外产出 amd64 离线 tar.gz，
+      # 已由上面的「Trigger Build & Publish」步骤在每次合并后自动派发，此处不重复。
 
