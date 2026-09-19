@@ -24,6 +24,11 @@ on:
         description: '上游引用（默认 master；可填分支/tag 做验证）'
         required: false
         default: master
+      dispatch_build:
+        description: '即使没有新代码也派发一次 build.yml（用于产出 amd64 离线 tar.gz）'
+        required: false
+        type: boolean
+        default: false
   push:
     branches: [master]
 
@@ -121,7 +126,7 @@ jobs:
       # build.yml 不会自己跑。用 workflow_dispatch 主动派发一次——这个事件是官方规则里
       # 唯一的例外，GITHUB_TOKEN + actions: write 即可，不需要 PAT。
       - name: Trigger Build & Publish (build.yml)
-        if: steps.merge.outputs.changed == 'true'
+        if: steps.merge.outputs.changed == 'true' || inputs.dispatch_build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
