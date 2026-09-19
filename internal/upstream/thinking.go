@@ -102,8 +102,16 @@ func backfillReasoningContent(obj map[string]any) {
 	if !thinkingEnabled && !hasTrace {
 		return
 	}
-	// 第二遍：所有 assistant 消息补/复制 reasoning_content 字段。
+	// 第二遍：所有 assistant 消息补/复制 reasoning_content 字段，并镜像保证
+	// reasoning 字段存在且非空（issue #165 追评——部分账号/租户对 thinking 形态
+	// 校验 len(reasoning)>0：缺失/null/空串 400，空白串 200；官方 CLI 本就给
+	// assistant 挂上一轮 reasoning 文本，见 itemsToMessages 的 applyPendingReasoning）。
 	// 跳过条件只认 string（官方 "string"!=typeof 才动手）：null/数字归一化。
+	//   - reasoning 已是非空 string → 不动；
+	//   - rc 是非空 string → 镜像写入 rc 值（两字段最终都存在且非空）；
+	//   - 两者皆无/皆空 → 补单个空格 " "（上游 len>0 不 trim：空白串过闸、空串
+	//     不过——空白串占位有官方 Moonshot 规则 "-" 同款先例，且对模型上下文
+	//     无语义影响：该字段是透传校验位非内容消费位）。
 	for _, mm := range msgs {
 		msg, ok := mm.(map[string]any)
 		if !ok {
@@ -113,13 +121,24 @@ func backfillReasoningContent(obj map[string]any) {
 		if role != "assistant" {
 			continue
 		}
-		if _, ok := msg["reasoning_content"].(string); ok {
-			continue // 已有 string → 不覆盖
-		}
-		if r, ok := msg["reasoning"].(string); ok {
-			msg["reasoning_content"] = r
+		rc, hasRC := msg["reasoning_content"].(string)
+		if hasRC {
+			// rc 已有 string → 不覆盖（原有语义保留）。
+		} else if r, ok := msg["reasoning"].(string); ok {
+			rc = r
+			msg["reasoning_content"] = rc
 		} else {
-			msg["reasoning_content"] = ""
+			rc = ""
+			msg["reasoning_content"] = rc
+		}
+		// 镜像：reasoning 缺失/null/空串 → 归一化（非空 rc 优先，皆无补 " "）。
+		if r, ok := msg["reasoning"].(string); ok && r != "" {
+			continue // 已非空 → 不覆盖
+		}
+		if rc != "" {
+			msg["reasoning"] = rc
+		} else {
+			msg["reasoning"] = " "
 		}
 	}
 }

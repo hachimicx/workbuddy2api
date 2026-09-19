@@ -316,9 +316,9 @@ func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
 		entry := map[string]any{
-			"id":                "cn:" + mi.ID,
-			"object":            "model",
-			"created":           1753600000,
+			"id":       "cn:" + mi.ID,
+			"object":   "model",
+			"created":  1753600000,
 			"owned_by": "workbuddy",
 		}
 		// context_length / max_output_tokens 四级查找（upstream.context_catalog +
@@ -515,8 +515,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// stickyKey 是**粘性专用**键，与 sessKey（会话头族聚合用）分开：
 	// sessKey 为空时（OpenAI 兼容客户端——dsh / Codex 等既无 conversationId 也无
 	// metadata）用首条 user 消息派生会话级 fallback 键，使粘性仍能生效。
-	// 不能直接改 sessKey：那会连带改变上游头族 RequestIDForKey 的聚合语义
-	// （会话级 vs 轮级兜底），属于另一条链路的契约。
+	// 不能直接改 sessKey：那会连带改变上游头族轮级复合键（sessKey 入键）的聚合
+	// 语义，属于另一条链路的契约。
 	stickyKey := sessKey
 	if stickyKey == "" {
 		stickyKey = session.StickyFallbackKey(body)
@@ -534,15 +534,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 轮级兜底聚合键：无会话键的客户端（OpenAI 兼容协议——dsh / Codex / Cherry
-	// Studio 等请求体里既无 conversationId 也无 metadata）sessKey 恒空，会话头族的
-	// 聚合主键此前只能逐请求新生成，agent 多轮在上游用量明细里仍是一条请求一条记录。
-	// 这里按 body 里最后一条 user 消息派生轮级键（同轮内所有上游调用同键）。
+	// 轮级聚合键：按 body 里最后一条 user 消息派生（同轮内所有上游调用同键，
+	// 换 user 消息换键）。#170 起带会话键的客户端也统一走轮级（与官方桌面 CLI 的
+	// X-Conversation-Request-ID 轮级语义对齐），故不再限 sessKey=="" 才计算；
+	// sessKey 由调用侧以复合键方式入键（防不同会话同轮文本互撞）。
 	// 必须在下方 prompt.Rewrite / rewriteModel 之前取——改写会动 messages 内容。
-	turnKey := ""
-	if sessKey == "" {
-		turnKey = session.TurnKey(body)
-	}
+	turnKey := session.TurnKey(body)
 
 	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
 	// 同理）。11133「模型不支持图片」指向的前提。
@@ -601,30 +598,41 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		body = rewriteModel(body, bareModel)
 	}
 
-	// 会话头族（issue #35）：后台按 X-Conversation-Request-ID 聚合请求，官方客户端
-	// 一次 user send 内所有 tool call/重试/换号复用同一个 ID。**双形态并存**（均对齐
-	// 官方）：带 conversationId 的客户端为**会话级**（对齐官方云链路 lfConvReqId 的
-	// 服务端下发后复用形态，跨轮同键）；无会话键的客户端为**轮级**（对齐官方桌面
-	// CLI / 排队链路的 queueRequestId 形态，同轮内复用、换 user 消息换键）。此处
-	// **轮转循环外**生成一次，循环内每次出站原样复用 → 换号/重试/降级全部同 ID，
-	// 后台不再碎片化（此前网关一个都不发，上游按 HTTP 请求逐条记账，同一对话几十
-	// 上百个 RequestID）。
+	// 会话头族（issue #35 / #170）：后台按 X-Conversation-Request-ID 聚合请求，官方
+	// 客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID。**统一轮级**
+	// （对齐官方桌面 CLI：TraceStartHook 每次 USER_PROMPT_SUBMIT 清空重生成
+	// conversationRequestId，同轮内复用、跨轮必换；官方云链路 lfConvReqId 的会话级
+	// 是服务端指令，走本网关的客户端不属于该形态）。此处**轮转循环外**生成一次，
+	// 循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再碎片化（此前网关
+	// 一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个 RequestID）。
 	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造，见
 	//     ResolveConversationID；官方后台不校验一致，空会话则不建立聚合键）；
 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先（客户端已
-	//     有自己的对话轮 ID 则以客户端为准），否则按粘性 key 进程内稳定生成（同会话
-	//     恒同值）；粘性 key 也为空时走轮级兜底（session.TurnKey/TurnRequestID），
-	//     无 user 消息时退化成本请求级 NewMessageID——轮转内捕获一次即共享；
+	//     有自己的对话轮 ID 则以客户端为准）。派生分两态：
+	//     * turnKey 非空（有末条 user 消息）→ 带会话键客户端走 TurnRequestID(
+	//       sessKey+":"+turnKey) 复合键（会话段入键保证不同会话同轮文本不互撞，
+	//       轮级粒度对齐官方 CLI）；无会话键客户端走既有 TurnRequestID(turnKey)
+	//       纯轮级键（存量会话键值零漂移）。
+	//     * turnKey 为空（残留空态：无 user 消息/无可签名内容）→ sessKey 非空时
+	//       回落 RequestIDForKey(sessKey)（会话级兜底，好于请求级随机）；sessKey
+	//       也空走 NewMessageID 请求级（TurnRequestID 空键行为）——轮转内捕获
+	//       一次即共享。
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
 	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
+	} else if turnKey != "" && sessKey != "" {
+		// 轮级复合键：sessKey 入键防跨会话同轮文本互撞。
+		chatMeta.ConversationRequestID = session.TurnRequestID(sessKey + ":" + turnKey)
+	} else if turnKey != "" {
+		// 无会话键客户端：纯轮级键（既有兜底语义不变，存量会话键值零漂移）。
+		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
 	} else if sessKey != "" {
+		// 残留空态兜底：无轮可聚合时维持会话级聚合（同会话恒同值）。
 		chatMeta.ConversationRequestID = session.RequestIDForKey(sessKey)
 	} else {
-		// 无会话键客户端：轮级兜底——同轮内 tool call 多轮 / 换号重试 / 降级重发
-		// 共享同键，用户发下一条消息自动换键。
-		chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
+		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
+		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 

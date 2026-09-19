@@ -301,16 +301,88 @@ func TestChatTurnKeyStableAcrossAgentSteps(t *testing.T) {
 	}
 }
 
-// TestChatSessionKeyBeatsTurnKey 会话键优先于轮级兜底：带 conversationId 时聚合键是
-// 会话级的（跨轮同键，不随末条 user 消息变化），与无会话键的轮级行为明确区分。
+// TestChatSessionKeyBeatsTurnKey 带 conversationId 时聚合键随末条 user 消息变化
+// （#170 统一轮级，取代旧「会话键跨轮稳定」契约——对齐官方 CLI）。同轮同会话
+// 仍同键（与 TestChatSessionKeyTurnStableWithinTurn 互补：这里覆盖顶层
+// conversationId 形态 + 重复文本轮不并轮）。
 func TestChatSessionKeyBeatsTurnKey(t *testing.T) {
 	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第一问"}]}`)
 	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第二问"}]}`)
 	if a == "" {
 		t.Fatal("X-Conversation-Request-ID missing")
 	}
+	if a == b {
+		t.Errorf("会话键路径应轮级换键（随末条 user 变化，#170 对齐官方 CLI）: %q", a)
+	}
+	// 同轮同会话（重复发同一问）：turnKey 含 user 序号 + 内容签名 → 同键。
+	c := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"conversationId":"conv-x","messages":[{"role":"user","content":"第一问"}]}`)
+	if a != c {
+		t.Errorf("同会话同轮文本应同聚合键: a=%q c=%q", a, c)
+	}
+}
+
+// TestChatSessionKeyTurnScoped issue #170 RED 锚（R1）：带会话键客户端
+// （metadata.conversation_id）同会话两轮（末条 user 不同）→ 出站
+// X-Conversation-Request-ID 必须不同——对齐官方桌面 CLI 的轮级语义
+// （TraceStartHook 每次 USER_PROMPT_SUBMIT 清空重生成）。旧行为
+// RequestIDForKey(sessKey) 会话级跨轮同值 → RED。
+func TestChatSessionKeyTurnScoped(t *testing.T) {
+	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-t"},"messages":[{"role":"user","content":"第一问"}]}`)
+	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-t"},"messages":[`+
+		`{"role":"user","content":"第一问"},{"role":"assistant","content":"答"},`+
+		`{"role":"user","content":"第二问"}]}`)
+	if a == "" || b == "" {
+		t.Fatal("X-Conversation-Request-ID missing on session-keyed request")
+	}
+	if a == b {
+		t.Errorf("同会话跨轮应换聚合 ID（轮级，对齐官方 CLI）: a=%q b=%q", a, b)
+	}
+}
+
+// TestChatSessionKeyTurnStableWithinTurn R2：带会话键客户端轮内 tool-call
+// 多步（追加 assistant/tool，末条 user 不变）→ 同 ID（#35 轮内聚合核心语义保留）。
+func TestChatSessionKeyTurnStableWithinTurn(t *testing.T) {
+	step1 := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-t"},"messages":[{"role":"user","content":"跑一下"}]}`)
+	step2 := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-t"},"messages":[`+
+		`{"role":"user","content":"跑一下"},`+
+		`{"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"pwsh"}}]},`+
+		`{"role":"tool","tool_call_id":"c1","content":"结果"}]}`)
+	if step1 == "" {
+		t.Fatal("X-Conversation-Request-ID missing")
+	}
+	if step1 != step2 {
+		t.Errorf("轮内追加消息不应改变聚合键（会话键客户端）: step1=%q step2=%q", step1, step2)
+	}
+}
+
+// TestChatSessionKeyCrossSessionSameTurnText R4：不同会话同轮文本 → 不同 ID
+// （sessKey 入复合键防跨会话互撞）。
+func TestChatSessionKeyCrossSessionSameTurnText(t *testing.T) {
+	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-a"},"messages":[{"role":"user","content":"同样的问题"}]}`)
+	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-b"},"messages":[{"role":"user","content":"同样的问题"}]}`)
+	if a == "" || b == "" {
+		t.Fatal("X-Conversation-Request-ID missing")
+	}
+	if a == b {
+		t.Errorf("不同会话同轮文本不应共用聚合 ID（会话段入键防撞）: %q", a)
+	}
+}
+
+// TestChatSessionKeyEmptyTurnKeyFallback R5：turnKey 空态（无 user 消息）
+// + sessKey 非空 → 会话级兜底同值（残留空态仍聚合，好于请求级随机）。
+func TestChatSessionKeyEmptyTurnKeyFallback(t *testing.T) {
+	a := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-e"},"messages":[{"role":"assistant","content":"续"}]}`)
+	b := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-e"},"messages":[{"role":"assistant","content":"又续"}]}`)
+	if a == "" || b == "" {
+		t.Fatal("X-Conversation-Request-ID missing")
+	}
 	if a != b {
-		t.Errorf("会话键路径应跨轮稳定（不受末条 user 变化影响）: %q vs %q", a, b)
+		t.Errorf("turnKey 空态应回落会话级兜底（同 sessKey 同值）: a=%q b=%q", a, b)
+	}
+	// 且是会话派生（非请求级随机）：同 body 重放同值。
+	c := turnRequestIDForBody(t, `{"model":"glm-5.2","stream":true,"metadata":{"conversation_id":"conv-e"},"messages":[{"role":"assistant","content":"续"}]}`)
+	if a != c {
+		t.Errorf("会话级兜底应为纯派生（同 body 同值）: a=%q c=%q", a, c)
 	}
 }
 

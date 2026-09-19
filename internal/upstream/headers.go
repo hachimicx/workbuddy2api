@@ -271,7 +271,9 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 //   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
 //     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
-//     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
+//     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）；
+//     换 user 消息即换键（#170 统一轮级，对齐官方 CLI 的 USER_PROMPT_SUBMIT 重生成
+//     语义；调用方 handler 负责保证轮级键的生成，透传客户端值优先）。
 //   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
 //   - X-Root-Request-ID：= conversationRequestID（根请求追踪）。
 //   - X-Trace-ID：入站透传或 = conversationRequestID。
