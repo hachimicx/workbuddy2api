@@ -37,6 +37,9 @@ concurrency:
 permissions:
   contents: write
   packages: write
+  # 推送后主动派发 build.yml 需要 actions: write（GITHUB_TOKEN 触发的 workflow_dispatch
+  # 是 GitHub 防递归规则的例外，无需 PAT；缺这个权限会 403 Resource not accessible）。
+  actions: write
 
 jobs:
   sync:
@@ -113,6 +116,18 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # GITHUB_TOKEN 推送的 commit 不会触发其它 workflow（防递归），所以合并提交之后
+      # build.yml 不会自己跑。用 workflow_dispatch 主动派发一次——这个事件是官方规则里
+      # 唯一的例外，GITHUB_TOKEN + actions: write 即可，不需要 PAT。
+      - name: Trigger Build & Publish (build.yml)
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run build.yml --repo "$GITHUB_REPOSITORY" --ref master
+          echo "已派发 build.yml（多架构镜像 + amd64 离线 tar.gz）"
 
       - name: Summary
         run: |
