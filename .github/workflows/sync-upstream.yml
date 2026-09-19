@@ -126,7 +126,8 @@ jobs:
 
   build:
     needs: sync
-    # schedule 且没同步到新东西 → 不用重建；手动触发 / 推到 master → 照常构建
+    # 只要 sync 产生了新提交就立刻构建（schedule 拉到新代码同样立即构建，不等下一次定时）；
+    # 手动触发 / 推送到 master 也照常构建。仅当 schedule 且没有任何新代码时跳过。
     if: needs.sync.outputs.changed == 'true' || github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
@@ -168,3 +169,8 @@ jobs:
             ${{ steps.image.outputs.name }}:${{ needs.sync.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # build.yml 里的 amd64 离线 tar.gz 不在这里重复：GITHUB_TOKEN 推送的 commit 不会触发
+      # 其它 workflow，所以合并提交之后 build.yml 不会自己跑。要离线包时，在 fork 上手动跑
+      # Actions → Build & Publish → Run workflow 即可（workflow_dispatch 会按当前 master 构建）。
+
