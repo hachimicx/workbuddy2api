@@ -14,8 +14,6 @@
     "pr_content_filtered": "🤖 The AI provider's content safety policy rejected this pull request, so automated checks cannot continue. The pull request will be closed. If you believe this is a mistake, edit the content and submit it again or contact the repository maintainers.",
     "pr_malicious": "🤖 This pull request contains suspicious or malicious content and will be closed. If you believe this is a mistake, please contact the repository maintainers.",
     "pr_trivial": "🤖 This pull request contains trivial or meaningless changes and will be closed. Please ensure the pull request provides a useful improvement.",
-    "pr_invalid_commit": "🤖 This pull request title is not descriptive enough or does not follow commit conventions and will be closed. If you believe this is a mistake, please contact the repository maintainers.",
-
     "governance_dry_run": "🤖 Dry-run mode is enabled: the governance action analyzed this issue but will NOT close or create any issue. Below is what it would have done.",
     "governance_merge_comment": "🤖 A bot summarized and triaged this issue (reopen or contact maintainers if you disagree).\n\n{summary}\n\nThis is highly related to canonical issue #{canonical} and will be merged there. This issue will be closed; track progress on the canonical issue.",
     "governance_merge_canonical_record": "🤖 Merge record (added by bot):\n\n- Source issue: #{source} (author @{author})\n- Extracted key points:\n{summary}\n- Merged at: {timestamp}",
@@ -23,13 +21,13 @@
     "governance_well_formed_comment": "🤖 This issue is already well-formed (template + complete), the bot only classifies it with repository labels and will not reopen or merge it.",
     "governance_uncertain_comment": "🤖 The bot could not reliably decide whether this issue duplicates an existing canonical issue (insufficient evidence), so it passes without closing. A maintainer will follow up.",
     "governance_ai_fallback_comment": "🤖 The AI governance service is currently unavailable. Per the fail-open policy the bot leaves this issue untouched (no close, no merge). Maintainers, please review.",
-
     "governance_pr_link_comment": "🤖 A bot summarized this PR and linked it to the canonical topic it addresses (contact maintainers if you disagree).\n\n{summary}\n{link_line}\n\nThis PR stays open and is NOT closed by the governance bot.",
     "governance_pr_match_link_line": "This PR belongs to canonical issue #{canonical}.",
     "governance_pr_new_link_line": "A new canonical issue #{canonical} has been drafted for this PR's topic.",
     "governance_pr_canonical_record": "🤖 PR link record (added by bot):\n\n- Source PR: #{source} (author @{author})\n- Extracted key points:\n{summary}\n- Linked at: {timestamp}",
     "governance_pr_uncertain_comment": "🤖 The bot could not reliably decide which canonical issue this PR belongs to (insufficient evidence), so it passes without linking. A maintainer will follow up.",
-
-    "governance_log_prefix": "✅ Bot action log: {action}"
+    "governance_log_prefix": "✅ Bot action log: {action}",
+    "issue_blacklist": "This issue was automatically closed because the author is on the blacklist.",
+    "governance_history_reference_note": "The historical entries cited above refer to their original threads by number."
   }
 }

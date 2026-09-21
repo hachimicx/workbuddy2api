@@ -27,6 +27,11 @@ async function run() {
       maxPatchLinesPerFile,
       customBaseUrl,
       customApiKey,
+      governanceToken,
+      prReviewClose,
+      maxRelatedIssues,
+      relatedCommentsPerIssue,
+      relatedBodyTruncate,
       canonicalLabel,
       duplicateLabel,
       skipUsers,
@@ -35,6 +40,11 @@ async function run() {
       enablePrGovernance,
       maxCanonicalIndex,
       canonicalBodyTruncate,
+      // 统一历史语境层（F1）与两段式流水线（F2）
+      maxHistoryIndex,
+      enableTwoStage,
+      maxScreenedCandidates,
+      screeningModel,
       config
     } = parseInputs(baseConfig);
 
@@ -44,7 +54,18 @@ async function run() {
     const octokit = github.getOctokit(token);
     const context = github.context;
 
+    // 治理身份令牌（可选）：写操作改用该令牌的客户端 —— REST 写入的作者头像/账号由令牌身份决定，
+    // 配置 Claude Code 的 PAT 后治理评论/关闭将以「Claude Code <noreply@anthropic.com>」发布。
+    // 无该令牌时与原来完全一致（github-actions[bot]），纯增量、不破坏既有行为。
+    let governanceOctokit = null;
+    if (governanceToken) {
+      governanceOctokit = github.getOctokit(governanceToken);
+      core.info(config.logging.governance_identity_enabled);
+    }
+
     // 确定使用的API配置
+    // 注意：AI 鉴权优先用 github-token —— GitHub Models 依赖 workflow 的 models:read 权限，
+    // 治理令牌（PAT）不一定具备，两者职责分离。
     const apiBaseUrl = customBaseUrl || config.defaults.api_base_url;
     const apiKey = customApiKey || token;
 
@@ -81,16 +102,28 @@ async function run() {
       maintainerExempt,
       enablePrGovernance,
       maxCanonicalIndex,
-      canonicalBodyTruncate
+      canonicalBodyTruncate,
+      // PR 历史语境评审（新增）
+      prReviewClose,
+      maxRelatedIssues,
+      relatedCommentsPerIssue,
+      relatedBodyTruncate,
+      // 统一历史语境层（F1）与两段式流水线（F2）
+      maxHistoryIndex,
+      enableTwoStage,
+      maxScreenedCandidates,
+      screeningModel,
+      governanceToken
     };
 
     // 根据事件类型处理
     if (context.eventName === 'issues' && context.payload.action === 'opened') {
-      await handleNewIssue(octokit, openai, context, owner, repo, aiModel, config, labelsList, blacklistUsers, gov);
+      await handleNewIssue(governanceOctokit || octokit, openai, context, owner, repo, aiModel, config, labelsList, blacklistUsers, gov);
     } else if ((context.eventName === 'pull_request_target') && context.payload.action === 'opened') {
       if (enablePrGovernance) {
         // PR 治理：上游垃圾检测（唯一会关 PR 的路径）+ 要点提炼 + canonical 关联（永不关闭合法 PR）
-        await handleNewPR(octokit, openai, context, owner, repo, aiModel, config, labelsList, blacklistUsers, gov);
+        // + 可选的历史语境评审（pr-review-close，见 prReviewService）
+        await handleNewPR(governanceOctokit || octokit, openai, context, owner, repo, aiModel, config, labelsList, blacklistUsers, gov);
       } else {
         core.info('PR 治理默认关闭（enable-pr-governance=false），跳过');
       }

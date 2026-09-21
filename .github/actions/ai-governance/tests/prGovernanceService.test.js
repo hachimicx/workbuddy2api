@@ -31,7 +31,14 @@ function makeOps({ canonicalItems = [] } = {}) {
     addComment: jest.fn().mockResolvedValue({}),
     addLabels: jest.fn().mockResolvedValue({}),
     updateIssueState: jest.fn().mockResolvedValue({}),
-    updatePullRequest: jest.fn().mockResolvedValue({})
+    updatePullRequest: jest.fn().mockResolvedValue({}),
+    searchIssuesAndPRs: jest.fn().mockResolvedValue([]),
+    getIssueDetail: jest.fn().mockImplementation(async (_o, _r, _repo, number) =>
+      ({ number, title: `详情${number}`, body: '正文全文', state: 'closed', state_reason: 'completed', closed_at: null })),
+    listIssueComments: jest.fn().mockResolvedValue([]),
+    listIssueTimeline: jest.fn().mockResolvedValue([]),
+    listPRFilesSummary: jest.fn().mockResolvedValue({ summary: 'a.js(+1/-1)', total: 1 }),
+    listPRCommits: jest.fn().mockResolvedValue([])
   };
 }
 
@@ -251,5 +258,84 @@ describe('PrGovernanceService', () => {
     const config = buildConfig();
     const svc = new PrGovernanceService({}, 'model', config, {}, makeOps());
     expect(svc.issueGov).toBeInstanceOf(IssueGovernanceService);
+  });
+
+  // ---- F2/F3：两段式归并匹配（共享历史索引，C5/R5 单次拉取）----
+
+  test('两段式开启 + ctx：归并匹配经筛选 AI，阶段二只看深补全候选（R9：含评论历史），不重复拉取', async () => {
+    const config = buildConfig();
+    // 调用顺序：extract(structured) -> canonical 语料筛查(structured) -> merge_match -> title
+    const openai = makeOpenai([
+      '```json\n{"要点":"加缓存","要做的事":[]}\n```',
+      '```json\n{"candidates":[{"number":57,"kind":"issue","relevance":"direct"}]}\n```',
+      'DUPLICATE(#57)',
+      'feat: add caching layer'
+    ]);
+    const ops = makeOps();
+    const ctx = {
+      historyContext: {
+        enrich: jest.fn().mockResolvedValue([{
+          number: 57, kind: 'issue', title: '缓存', body: '正文',
+          state: 'closed', state_reason: 'completed', closed_at: null,
+          comments: [{ author: 'maintainer', body: '方案已定', created_at: '2026-01-01' }],
+          timeline: []
+        }])
+      },
+      index: [
+        { number: 57, kind: 'issue', title: '缓存', labels: ['canonical'], state: 'closed', state_reason: 'completed', closed_at: null, body: '正文' },
+        { number: 58, kind: 'issue', title: '无关', labels: ['canonical'], state: 'closed', state_reason: null, closed_at: null, body: 'b' }
+      ]
+    };
+    const svc = new PrGovernanceService(openai, 'model', config, { dryRun: false, enableTwoStage: true }, ops);
+
+    const result = await svc.govern({}, 'o', 'r', pr, null, ctx);
+
+    expect(result).toMatchObject({ decision: GOVERNANCE_DECISIONS.DUPLICATE, canonicalNumber: 57, linked: true });
+    // 共享索引：不再走旧 listCanonicalIssues
+    expect(ops.listCanonicalIssues).not.toHaveBeenCalled();
+    // 阶段一收紧凑 canonical 索引；阶段二语料是深补全的单条候选（含评论历史，R9）
+    const screenInput = JSON.parse(openai._create.mock.calls[1][0].messages[1].content);
+    expect(screenInput.index.map(i => i.number)).toEqual([57, 58]);
+    const matchInput = JSON.parse(openai._create.mock.calls[2][0].messages[1].content);
+    expect(matchInput.canonical_index).toHaveLength(1);
+    expect(matchInput.canonical_index[0].body).toContain('maintainer: 方案已定');
+  });
+
+  test('两段式开启 + ctx + 归并防幻觉：DUPLICATE 引用候选外编号 → 降级 UNCERTAIN 放行', async () => {
+    const config = buildConfig();
+    const openai = makeOpenai([
+      '```json\n{"要点":"加缓存","要做的事":[]}\n```',
+      '```json\n{"candidates":[]}\n```',
+      'DUPLICATE(#999)'
+    ]);
+    const ops = makeOps();
+    const ctx = {
+      historyContext: { enrich: jest.fn() },
+      index: [{ number: 57, kind: 'issue', title: '缓存', labels: ['canonical'], state: 'closed', state_reason: null, closed_at: null, body: 'b' }]
+    };
+    const svc = new PrGovernanceService(openai, 'model', config, { dryRun: false, enableTwoStage: true }, ops);
+
+    const result = await svc.govern({}, 'o', 'r', pr, null, ctx);
+
+    expect(result).toMatchObject({ decision: GOVERNANCE_DECISIONS.UNCERTAIN, passed: true });
+    expect(ops.updatePullRequest).not.toHaveBeenCalled();
+  });
+
+  test('两段式关闭（默认）：行为与原先一致——直接 listCanonicalIssues，无筛查调用', async () => {
+    const config = buildConfig();
+    const openai = makeOpenai([
+      '```json\n{"要点":"加缓存","要做的事":[]}\n```',
+      'DUPLICATE(#57)',
+      'feat: add caching layer'
+    ]);
+    const ops = makeOps({ canonicalItems: [{ number: 57, title: '缓存', body: '...' }] });
+    const svc = new PrGovernanceService(openai, 'model', config, { dryRun: false }, ops);
+
+    const result = await svc.govern({}, 'o', 'r', pr, null, null);
+
+    expect(result).toMatchObject({ decision: GOVERNANCE_DECISIONS.DUPLICATE, canonicalNumber: 57 });
+    expect(ops.listCanonicalIssues).toHaveBeenCalledTimes(1);
+    // 3 次调用：extract + merge + title；无筛查插入
+    expect(openai._create).toHaveBeenCalledTimes(3);
   });
 });

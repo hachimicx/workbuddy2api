@@ -59,9 +59,15 @@ const GOVERNANCE_DECISIONS = {
   WELL_FORMED: 'WELL_FORMED'
 };
 
+// PR 历史语境评审判定值（AI 归一化返回）
+const PR_REVIEW_DECISIONS = {
+  CLOSE: 'CLOSE',
+  KEEP: 'KEEP',
+  UNCERTAIN: 'UNCERTAIN'
+};
+
 // 默认配置值
 const DEFAULTS = {
-  MAX_TOKENS: 100,
   TEMPERATURE: 0.1,
   MAX_FILES: 5,
   MAX_PATCH_LINES: 5,
@@ -83,6 +89,20 @@ const GOVERNANCE_DEFAULTS = {
   wellFormedMinSections: 3,
   wellFormedMinTitleLen: 8,
   wellFormedMinBodyLen: 80,
+  // PR 历史语境评审（prReviewService）：默认关闭 —— 会关 PR 的新能力必须显式开启
+  prReviewClose: false,
+  maxRelatedIssues: 3,
+  relatedCommentsPerIssue: 10,
+  relatedBodyTruncate: 1500,
+  // 统一历史语境层（F1）：紧凑索引上限（issue+PR 全量语料）
+  maxHistoryIndex: 100,
+  // 两段式 AI 流水线（F2）：默认关闭，先暗发观察再翻转（与 pr-review-close 同上线纪律）
+  enableTwoStage: false,
+  maxScreenedCandidates: 5,
+  screeningModel: '',
+  // 历史语境评审关闭的 PR 的确定性标签（R6/C6）：state_reason 对 PR 不可写，
+  // 标签是唯一可查的关闭理由标记（is:label 历史检索口径，供未来筛选阶段做语料信号）
+  historyRejectedLabel: 'history-rejected',
   // 永远豁免的账号（bot 自环防护）
   SKIP_USERS: ['github-actions[bot]', 'github-actions']
 };
@@ -95,5 +115,6 @@ module.exports = {
   ANALYSIS_DEPTHS,
   DEFAULTS,
   GOVERNANCE_DECISIONS,
+  PR_REVIEW_DECISIONS,
   GOVERNANCE_DEFAULTS
 };

@@ -1,5 +1,6 @@
 const { callAI } = require('./ai');
 const ClassificationService = require('./classificationService');
+const { isValidCommitTitle } = require('../utils/helpers');
 
 /**
  * Issue分析服务 - 负责各种AI分析任务
@@ -186,15 +187,13 @@ class IssueAnalyzer {
   }
 
   /**
-   * 检测PR提交标题规范性（第二步）
+   * 检测PR提交标题规范性（第二步）。
+   * R11/C11：改用确定性 Conventional Commits 校验（helpers.isValidCommitTitle，
+   * 与 prGovernanceService.resolveTitle 同一口径），去掉此前这一次 AI 调用 ——
+   * 每个PR 省 1 次 AI 调用；AI 只保留给「起草新标题」（governance_pr_title）。
    */
   async checkPRCommitCompliance(pr) {
-    const request = {
-      instructions: this.config.prompts.pr_commit_check,
-      input: JSON.stringify({ title: pr.title })
-    };
-    
-    return await callAI(this.openai, this.aiModel, request, this.config, 'PR提交规范检查');
+    return isValidCommitTitle(pr.title || '') ? 'VALID' : 'INVALID';
   }
 
   /**
@@ -227,11 +226,11 @@ class IssueAnalyzer {
       return { decision: 'SPAM', step: 1 };
     }
 
-    // 第二步：提交规范检查
-    console.log(this.config.logging.pr_commit_check_start || '第2步：检查提交标题规范');
+    // 第二步：提交规范检查（R11：确定性 Conventional Commits 校验，不再调 AI）
+    console.log('第2步：检查提交标题规范（确定性校验）');
     const commitResult = await this.checkPRCommitCompliance(pr);
-    console.log((this.config.logging.pr_commit_check_result || 'PR提交规范检查结果: {result}').replace('{result}', commitResult));
-    
+    console.log(`PR提交规范检查结果: ${commitResult}`);
+
     if (commitResult === 'INVALID') {
       return { decision: 'INVALID_COMMIT', step: 2 };
     }

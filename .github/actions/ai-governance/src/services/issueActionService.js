@@ -100,6 +100,27 @@ class IssueActionService {
   }
 
   /**
+   * 关闭 BASIC 内容分级的问题 issue：评论 issue_basic + 关闭 + 锁定。
+   * 此前该方法是 issueWorkflowService 的调用目标但从未定义（C3）——
+   * BASIC 路径一直 TypeError 后被吞掉，带着 classification=null 流入治理层。
+   * @param {string} logTemplate 已解析的日志模板（调用方传 config.logging.* 的值）
+   */
+  async closeAndLock(owner, repo, issueNumber, comment, logTemplate) {
+    await closeIssue(
+      this.octokit,
+      owner,
+      repo,
+      issueNumber,
+      comment,
+      this.config,
+      true,
+      'not_planned'
+    );
+
+    core.info(logMessage(logTemplate, { number: issueNumber }));
+  }
+
+  /**
    * 关闭README相关的Issue（不锁定）
    */
   async closeReadmeCoveredIssue(owner, repo, issue) {

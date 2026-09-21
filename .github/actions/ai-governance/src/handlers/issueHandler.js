@@ -115,6 +115,14 @@ async function handleNewIssue(octokit, openai, context, owner, repo, aiModel, co
       // UNCLEAR：已要求补充信息，此处停留，不进入治理
       return;
     }
+    if (triage.error) {
+      // 分诊失败（FIX-D/C8）：绝不能带着 classification=null 流入治理 ——
+      // splitCanonical 会把崩溃的 bug 报告误前缀成 [Feature]，污染 canonical 索引。
+      // 宁可漏判：fail-open 评论后放行，维护者可重跑。
+      core.warning(logMessage(config.logging.classification_failed, { error: 'triage error, skip governance' }));
+      await failOpenComment(octokit, owner, repo, issue, config);
+      return;
+    }
     const classification = triage.classification;
 
     if (skipGovernance) {
@@ -123,10 +131,20 @@ async function handleNewIssue(octokit, openai, context, owner, repo, aiModel, co
       return;
     }
 
-    // 治理层：要点提炼 + 归并匹配 + 规范化重开
+    // 治理层：要点提炼 + 归并匹配 + 规范化重开。
+    // F3：两段式开启时构建共享历史索引单次拉取（issue+PR 语料，C5/R5），传入治理与评审；
+    //      关闭时 ctx=null，治理服务自取 canonical 索引，行为与原先完全一致。
+    let sharedCtx = null;
+    if (gov.enableTwoStage) {
+      const HistoryContextService = require('../services/historyContextService');
+      const historyContext = new HistoryContextService(octokit, config, gov);
+      const index = await historyContext.buildIndex(owner, repo);
+      sharedCtx = { historyContext, index };
+    }
+
     // 注：classification 来自 AI 归一化（大写），这里回落到仓库 label 的真实大小写
     const governanceService = new IssueGovernanceService(openai, aiModel, config, gov);
-    await governanceService.govern(octokit, owner, repo, issue, resolveLabel(classification, labelsList));
+    await governanceService.govern(octokit, owner, repo, issue, resolveLabel(classification, labelsList), sharedCtx);
 
   } catch (error) {
     core.error(logMessage(config.logging.issue_process_error, { error: error.message }));

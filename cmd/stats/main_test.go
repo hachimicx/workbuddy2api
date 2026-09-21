@@ -547,8 +547,12 @@ func TestBuildFrameStructure(t *testing.T) {
 		t.Errorf("标题不应出现「运行」（会被误读为进程 uptime），得到 %q", frame[0])
 	}
 	// 同时给出起始时刻，进一步消除歧义。
-	if !strings.Contains(frame[0], "自 09-14 20:43") {
-		t.Errorf("标题应含窗口起始时刻，得到 %q", frame[0])
+	parsed, err := time.Parse(time.RFC3339, st.Since)
+	if err != nil {
+		t.Fatalf("parse test since: %v", err)
+	}
+	if want := "自 " + parsed.Local().Format("01-02 15:04"); !strings.Contains(frame[0], want) {
+		t.Errorf("标题应含窗口起始时刻 %q，得到 %q", want, frame[0])
 	}
 	if !strings.Contains(frame[len(frame)-1], "账号积分") {
 		t.Errorf("尾注应说明扣费单位，得到 %q", frame[len(frame)-1])

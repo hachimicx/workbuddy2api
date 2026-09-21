@@ -54,8 +54,9 @@ class PrGovernanceService {
    * @param {string} repo
    * @param {Object} pr 结构含 number/title/body/user.login
    * @param {string} classification PR 分类标签（可空；新主题建 issue 时随 canonical 一起打）
+   * @param {Object|null} ctx 共享历史语境（F3）：{ historyContext, index }，两段式开启时由 handler 单次构建
    */
-  async govern(octokit, owner, repo, pr, classification = null) {
+  async govern(octokit, owner, repo, pr, classification = null, ctx = null) {
     const { number } = pr;
     core.info(logMessage(this.config.logging.governance_pr_start, { number }));
     if (this.gov.dryRun) {
@@ -66,24 +67,8 @@ class PrGovernanceService {
     const keyPoints = await this.issueGov.extractKeyPoints(pr);
     const summary = keyPoints.summary;
 
-    // 2. 拉 canonical 索引（失败容忍为空 → 新主题；复用 issue 治理的 ops.listCanonicalIssues）
-    let canonicalList = [];
-    try {
-      core.info(logMessage(this.config.logging.governance_fetch_canonical, { label: this.gov.canonicalLabel }));
-      canonicalList = await this.ops.listCanonicalIssues(
-        octokit,
-        owner,
-        repo,
-        this.gov.canonicalLabel,
-        this.gov.maxCanonicalIndex,
-        this.gov.canonicalBodyTruncate,
-        true
-      );
-      core.info(logMessage(this.config.logging.governance_canonical_count, { count: canonicalList.length }));
-    } catch (error) {
-      core.warning(logMessage(this.config.logging.governance_canonical_fetch_failed, { error: error.message }));
-      canonicalList = [];
-    }
+    // 2. 归并语料：两段式开启 → 共享索引筛 canonical（F2/F3，单次拉取 C5/R5）；关闭 → 旧 listCanonicalIssues
+    const canonicalList = await this.issueGov.obtainCanonicalCorpus(octokit, owner, repo, ctx, pr);
 
     // 3. 归并匹配（复用 issue 治理的 matchCanonical；无索引直接视为新主题）
     let match = { decision: GOVERNANCE_DECISIONS.NEW_TOPIC };

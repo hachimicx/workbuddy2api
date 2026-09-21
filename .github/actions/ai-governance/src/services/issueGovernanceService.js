@@ -114,6 +114,7 @@ class IssueGovernanceService {
 
   /**
    * 第三步：归并匹配。返回 DUPLICATE(#N) / NEW_TOPIC / UNCERTAIN。
+   * F2 防幻觉闸门：DUPLICATE(#N) 的 N 必须在候选语料里，否则降级 UNCERTAIN（宁可漏判）。
    */
   async matchCanonical(issue, canonicalList) {
     core.info(logMessage(this.config.logging.governance_match_start, { number: issue.number }));
@@ -129,12 +130,42 @@ class IssueGovernanceService {
     const match = (raw || '').trim();
     const dup = match.match(DUPLICATE_PATTERN);
     if (dup) {
-      return { decision: GOVERNANCE_DECISIONS.DUPLICATE, canonicalNumber: parseInt(dup[1], 10) };
+      const canonicalNumber = parseInt(dup[1], 10);
+      if (!canonicalList.some(c => c.number === canonicalNumber)) {
+        core.warning(logMessage(this.config.logging.governance_match_candidate_rejected, { number: canonicalNumber }));
+        return { decision: GOVERNANCE_DECISIONS.UNCERTAIN };
+      }
+      return { decision: GOVERNANCE_DECISIONS.DUPLICATE, canonicalNumber };
     }
     if (/^NEW_TOPIC/.test(match)) {
       return { decision: GOVERNANCE_DECISIONS.NEW_TOPIC };
     }
     return { decision: GOVERNANCE_DECISIONS.UNCERTAIN };
+  }
+
+  /**
+   * 为规范 issue 生成 AI 评审评论：感谢 + 分析认可 + 实现方案 + 后续邀请 PR。
+   * 输入中的 title/body 均为不可信数据，作者与编号由服务端注入，避免模板被伪造。
+   * F3：可携带 relatedHistory（筛查出的相关历史 issue/PR，含结论摘要），
+   * 「实现方案/后续」可引用真实历史结论；空数组时提示词要求不引用任何编号（防幻觉）。
+   * @param {Object} issue
+   * @param {Array} relatedHistory [{ number, kind, title, state, state_reason, conclusion_snippet }]
+   * @returns {Promise<string|null>} AI 生成的评论文本，失败时返回 null 由调用方兜底
+   */
+  async draftWellFormedReview(issue, relatedHistory = []) {
+    const { title, body } = splitTitleBody(issue);
+    const request = {
+      instructions: this.config.prompts.governance_well_formed_review,
+      input: JSON.stringify({
+        title,
+        body,
+        author: issue.user?.login || 'unknown',
+        number: issue.number,
+        related_history: (relatedHistory || []).slice(0, this.gov.maxScreenedCandidates)
+      })
+    };
+    const raw = await callAI(this.openai, this.aiModel, request, this.config, '生成规范 issue 评审评论', false);
+    return String(raw || '').trim() || null;
   }
 
   /**
@@ -185,8 +216,9 @@ class IssueGovernanceService {
    * @param {string} repo
    * @param {Object} issue 结构含 number/title/body/user.login
    * @param {string|null} classification 分类标签（bug/enhancement/...）
+   * @param {Object|null} ctx 共享历史语境（F3）：{ historyContext, index }，两段式开启时由 handler 单次构建
    */
-  async govern(octokit, owner, repo, issue, classification = null) {
+  async govern(octokit, owner, repo, issue, classification = null, ctx = null) {
     const { number } = issue;
     core.info(logMessage(this.config.logging.governance_start, { number }));
     if (this.gov.dryRun) {
@@ -200,26 +232,11 @@ class IssueGovernanceService {
     // 2. 规范判定
     const wellFormed = await this.checkWellFormed(issue);
 
-    // 3. 拉取 canonical 索引（失败容忍为空，宁缺毋滥）
-    let canonicalList = [];
-    try {
-      core.info(logMessage(this.config.logging.governance_fetch_canonical, { label: this.gov.canonicalLabel }));
-      canonicalList = await this.ops.listCanonicalIssues(
-        octokit,
-        owner,
-        repo,
-        this.gov.canonicalLabel,
-        this.gov.maxCanonicalIndex,
-        this.gov.canonicalBodyTruncate,
-        true
-      );
-      core.info(logMessage(this.config.logging.governance_canonical_count, { count: canonicalList.length }));
-    } catch (error) {
-      core.warning(logMessage(this.config.logging.governance_canonical_fetch_failed, { error: error.message }));
-      canonicalList = [];
-    }
+    // 3. 归并语料：两段式开启 → 共享历史索引筛 canonical（F2/F3）；关闭 → 直接拉 canonical 列表（旧行为）
+    const canonicalList = await this.obtainCanonicalCorpus(octokit, owner, repo, ctx, issue);
 
-    // 4. 归并匹配（无 canonical 索引时直接视为新主题，省一次 AI 调用）
+    // 4. 归并匹配（无 canonical 索引时直接视为新主题，省一次 AI 调用；
+    //    防幻觉闸门在 matchCanonical 内部：DUPLICATE(#N) 的 N 必须在语料里）
     let match = { decision: GOVERNANCE_DECISIONS.NEW_TOPIC };
     if (canonicalList.length > 0) {
       match = await this.matchCanonical(issue, canonicalList);
@@ -234,11 +251,131 @@ class IssueGovernanceService {
     } else if (match.decision === GOVERNANCE_DECISIONS.UNCERTAIN) {
       return await this.routeUncertain(octokit, owner, repo, issue, summary);
     } else if (wellFormed === 'WELL_FORMED') {
-      // 新主题 + 已规范：原地提升为 canonical，不重开
-      return await this.routePromoteInPlace(octokit, owner, repo, issue, summary, classification);
+      // 新主题 + 已规范：原地提升为 canonical，不重开。
+      // F3：两段式开启时先筛查相关历史（共享索引，不重复拉取）供评审评论引用
+      const relatedHistory = await this.obtainRelatedHistory(ctx, issue);
+      return await this.routePromoteInPlace(octokit, owner, repo, issue, summary, classification, relatedHistory);
     } else {
       // 新主题 + 不规范：重开成规范 canonical
       return await this.routeNormalize(octokit, owner, repo, issue, summary, keyPoints, classification);
+    }
+  }
+
+  /**
+   * 为规范 issue 评审评论筛查相关历史（F3）：
+   * 两段式开启且有共享索引 → 筛选 AI 在全量索引（issue+PR，C10）上选候选，
+   * 返回紧凑形状 [{ number, kind, title, state, state_reason, conclusion_snippet }]（封顶 maxScreenedCandidates）；
+   * 其余情形返回 []（评审评论不带历史引用，行为与原先一致）。
+   */
+  async obtainRelatedHistory(ctx, issue) {
+    if (!this.gov.enableTwoStage || !ctx || !Array.isArray(ctx.index) || ctx.index.length === 0) {
+      return [];
+    }
+    const ScreeningService = require('./screeningService');
+    const screening = new ScreeningService(this.openai, this.aiModel, this.config, this.gov);
+    try {
+      const screened = await screening.screen(
+        { kind: 'issue', number: issue.number, title: issue.title, body: issue.body },
+        ctx.index
+      );
+      return screened
+        .map(c => {
+          const hit = ctx.index.find(i => i.kind === c.kind && i.number === c.number);
+          if (!hit) {
+            return null;
+          }
+          const conclusion = hit.state_reason
+            ? `${hit.state} (${hit.state_reason})`
+            : hit.state;
+          return {
+            number: hit.number,
+            kind: hit.kind,
+            title: hit.title,
+            state: hit.state,
+            state_reason: hit.state_reason,
+            conclusion_snippet: `#${hit.number} ${hit.title} — ${conclusion}`
+          };
+        })
+        .filter(Boolean);
+    } catch (error) {
+      core.warning(logMessage(this.config.logging.history_screening_failed, { error: error.message }));
+      return [];
+    }
+  }
+
+  /**
+   * 归并语料获取（F2/F3）：
+   *   - enableTwoStage 开启：从共享历史索引（ctx，C5 单次拉取）筛出 canonical-labeled 条目，
+   *     先经筛选 AI 选候选（issue+PR 语料里 canonical 标记的），候选深补全后作为阶段二语料 ——
+   *     阶段二看到候选的评论历史（R9：merge-match 语料含评论历史）；
+   *   - 关闭：直接 listCanonicalIssues（与原先完全一致）。
+   * 两条路径都失败容忍为空（→ 视为新主题）。
+   */
+  async obtainCanonicalCorpus(octokit, owner, repo, ctx, issue) {
+    // 旧行为（flag off / 无 ctx）：直接拉 canonical 列表
+    if (!this.gov.enableTwoStage || !ctx || !Array.isArray(ctx.index)) {
+      let canonicalList = [];
+      try {
+        core.info(logMessage(this.config.logging.governance_fetch_canonical, { label: this.gov.canonicalLabel }));
+        canonicalList = await this.ops.listCanonicalIssues(
+          octokit,
+          owner,
+          repo,
+          this.gov.canonicalLabel,
+          this.gov.maxCanonicalIndex,
+          this.gov.canonicalBodyTruncate,
+          true
+        );
+        core.info(logMessage(this.config.logging.governance_canonical_count, { count: canonicalList.length }));
+      } catch (error) {
+        core.warning(logMessage(this.config.logging.governance_canonical_fetch_failed, { error: error.message }));
+        canonicalList = [];
+      }
+      return canonicalList;
+    }
+
+    // 两段式：共享索引里筛 canonical 条目 → 筛选 AI 选候选 → 深补全（含评论历史，R9）
+    const canonicalIndex = ctx.index.filter(item =>
+      item.kind === 'issue' && (item.labels || []).includes(this.gov.canonicalLabel)
+    );
+    if (canonicalIndex.length === 0) {
+      core.info(logMessage(this.config.logging.governance_canonical_count, { count: 0 }));
+      return [];
+    }
+
+    const ScreeningService = require('./screeningService');
+    const screening = new ScreeningService(this.openai, this.aiModel, this.config, this.gov);
+    const screened = await screening.screen(
+      { kind: 'issue', number: issue.number, title: issue.title, body: issue.body },
+      canonicalIndex
+    );
+
+    if (screened.length === 0) {
+      // 筛选为空 → 回落全量 canonical 索引（截断口径与旧行为一致），不做全量补全（省 API 调用）
+      return canonicalIndex.slice(0, this.gov.maxCanonicalIndex).map(item => ({
+        number: item.number,
+        title: item.title,
+        body: item.body || '',
+        state: item.state,
+        state_reason: item.state_reason,
+        closed_at: item.closed_at
+      }));
+    }
+
+    // 候选深补全：正文 + 评论 + 时间线（R9：阶段二语料含 canonical 评论历史）
+    try {
+      const enriched = await ctx.historyContext.enrich(owner, repo, screened.map(c => ({ number: c.number, kind: 'issue' })));
+      return enriched.map(e => ({
+        number: e.number,
+        title: e.title,
+        body: [e.body, ...(e.comments || []).map(c => `${c.author}: ${c.body}`)].join('\n\n---\n\n'),
+        state: e.state,
+        state_reason: e.state_reason,
+        closed_at: e.closed_at
+      }));
+    } catch (error) {
+      core.warning(logMessage(this.config.logging.governance_canonical_fetch_failed, { error: error.message }));
+      return [];
     }
   }
 
@@ -275,13 +412,13 @@ class IssueGovernanceService {
     return { decision: GOVERNANCE_DECISIONS.UNCERTAIN, passed: true };
   }
 
-  async routePromoteInPlace(octokit, owner, repo, issue, summary, classification) {
+  async routePromoteInPlace(octokit, owner, repo, issue, summary, classification, relatedHistory = []) {
     const { number } = issue;
     const labels = [this.gov.canonicalLabel];
     if (classification) {
       labels.push(classification);
     }
-    const comment = this.render('governance_well_formed_comment', { summary });
+    const comment = await this.buildWellFormedComment(issue, summary, relatedHistory);
 
     if (this.gov.dryRun) {
       await this.postDryRun(octokit, owner, repo, issue, comment, `无需重开，仅打标 ${labels.join(',')}`);
@@ -293,6 +430,60 @@ class IssueGovernanceService {
 
     core.info(logMessage(this.config.logging.governance_well_formed, { number }));
     return { decision: 'WELL_FORMED', promoted: true };
+  }
+
+  /**
+   * 规范 issue 的评论内容：优先用 AI 生成「分析认可 + 实现方案 + 后续」的实质性评审；
+   * AI 失败时回落到既有固定模板，保证流程永不中断（宁可漏判、不可误关精神）。
+   * 两种路径都统一追加机器人操作日志行，用户仍能识别这是机器人评论。
+   * F3：可携带 relatedHistory 供评审引用；草稿引用的每个 #N 都过确定性校验（防幻觉），
+   * 校验失败回落固定模板（不发布含幻觉编号的公开评论）。
+   */
+  async buildWellFormedComment(issue, summary, relatedHistory = []) {
+    try {
+      const review = await this.draftWellFormedReview(issue, relatedHistory);
+      if (review) {
+        const validNumbers = new Set([issue.number, ...(relatedHistory || []).map(h => h.number)]);
+        const cited = review.match(/#(\d+)/g) || [];
+        const fabricated = cited.filter(m => !validNumbers.has(parseInt(m.slice(1), 10)));
+        if (fabricated.length > 0) {
+          // 引用闸门（F3）：草稿引用了历史集合之外的编号 → 整条草稿作废，回落固定模板
+          core.warning(logMessage(this.config.logging.governance_citation_rejected, {
+            number: issue.number,
+            cited: fabricated.join(' ')
+          }));
+        } else {
+          let text = this.withLogLine(this.withBotPrefix(review), 'governance_well_formed_comment');
+          if (relatedHistory.length > 0) {
+            // 有引用历史时服务端确定性追加一行指引（与 PR 评审评论同约定）
+            text = `${text}\n\n${this.config.responses.governance_history_reference_note}`;
+          }
+          return text;
+        }
+      }
+    } catch (error) {
+      core.warning(logMessage(this.config.logging.governance_review_failed, {
+        number: issue.number,
+        error: error.message
+      }));
+    }
+    return this.render('governance_well_formed_comment', { summary });
+  }
+
+  /**
+   * 给 AI 生成的评论补上机器人操作日志行（与 render() 的尾部行为保持一致）。
+   */
+  withLogLine(text, action) {
+    return `${text}\n\n${logMessage(this.config.responses.governance_log_prefix, { action })}`;
+  }
+
+  /**
+   * 确保 AI 评审评论以 🤖 开头（与固定模板一致）：
+   * 机器人身份标记由服务端确定性保证，不依赖模型自觉。
+   */
+  withBotPrefix(text) {
+    const trimmed = String(text || '').trim();
+    return trimmed.startsWith('🤖') ? trimmed : `🤖 ${trimmed}`;
   }
 
   async routeNormalize(octokit, owner, repo, issue, summary, keyPoints, classification) {

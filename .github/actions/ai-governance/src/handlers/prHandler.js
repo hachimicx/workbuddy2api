@@ -2,6 +2,7 @@ const core = require('@actions/core');
 const { logMessage, handleApiCall } = require('../utils/helpers');
 const PrWorkflowService = require('../services/prWorkflowService');
 const PrGovernanceService = require('../services/prGovernanceService');
+const PrReviewService = require('../services/prReviewService');
 const { isContentFilterError } = require('../services/ai');
 const { closePR, addComment } = require('../services/github');
 const { GOVERNANCE_DEFAULTS } = require('../utils/constants');
@@ -10,11 +11,14 @@ const { GOVERNANCE_DEFAULTS } = require('../utils/constants');
  * 处理新创建的PR。
  *
  * 链路（详见 DESIGN.md「§PR 治理」）：
- *   黑名单 → 垃圾检测（SPAM/恶意/trivial → 关闭，这是唯一会关 PR 的路径）
- *   → 有效 PR 分类打标 → 维护者/跳过名单豁免 → 治理（要点提炼 + canonical 关联，永不关闭合法 PR）。
+ *   黑名单 → 垃圾检测（SPAM/恶意/trivial → 关闭）
+ *   → 有效 PR 分类打标 → 维护者/跳过名单豁免
+ *   → 历史语境评审（pr-review-close 开启时：AI 对照相关历史 issue 的结论评审本 PR，
+ *      证据确凿 → 评审评论 + 关闭；证据不足 → 回落旧链路）
+ *   → 治理（要点提炼 + canonical 关联）。
  *
  * 与 issue 治理的安全阀完全同构：维护者 PR 跳过治理（垃圾检测保留）、dry-run 只评论、
- * AI 失败放行不动作。PR 治理永远不关闭 PR。
+ * AI 失败放行不动作。历史语境评审是唯一新增的合法 PR 关闭路径，且默认关闭（pr_review_close=false）。
  *
  * @param {Object} octokit GitHub API客户端
  * @param {Object} openai OpenAI客户端
@@ -84,9 +88,29 @@ async function handleNewPR(octokit, openai, context, owner, repo, aiModel, confi
       }
     }
 
+    // 历史语境评审层（可选，pr-review-close 开启时）：AI 对照相关历史 issue/PR 的关闭结论评审本 PR。
+    // 返回 null（未触发/证据不足/回落）时继续走下方旧关联链路；已处理（含 dry-run）则直接结束。
+    // F3：两段式开启时，评审与治理共享同一份历史索引（单次拉取，C5/R5）；
+    //      两段式关闭时 ctx=null，各服务行为与原先完全一致（byte-identical）。
+    let sharedCtx = null;
+    if (gov.enableTwoStage) {
+      const HistoryContextService = require('../services/historyContextService');
+      const historyContext = new HistoryContextService(octokit, config, gov);
+      const index = await historyContext.buildIndex(owner, repo);
+      sharedCtx = { historyContext, index };
+    }
+
+    if (gov.prReviewClose) {
+      const reviewService = new PrReviewService(openai, aiModel, config, gov);
+      const reviewResult = await reviewService.review(octokit, owner, repo, pr, fileChanges, sharedCtx);
+      if (reviewResult) {
+        return;
+      }
+    }
+
     // 治理层：要点提炼 + canonical 关联（永不关闭 PR）
     const governanceService = new PrGovernanceService(openai, aiModel, config, gov);
-    await governanceService.govern(octokit, owner, repo, pr, classification);
+    await governanceService.govern(octokit, owner, repo, pr, classification, sharedCtx);
 
   } catch (error) {
     core.error(logMessage(config.logging.pr_process_error, { error: error.message }));
@@ -101,7 +125,8 @@ async function handleNewPR(octokit, openai, context, owner, repo, aiModel, confi
         pr,
         config,
         'pr_content_filtered',
-        'pr_content_filtered_log'
+        'pr_content_filtered_log',
+        false // 不锁定：回应承诺「编辑内容后重新提交」，与 issue 路径对齐（C4）
       );
       return;
     }
@@ -121,15 +146,18 @@ async function handleNewPR(octokit, openai, context, owner, repo, aiModel, confi
  * @param {Object} config 配置对象
  * @param {string} responseKey 响应消息键名
  * @param {string} logKey 日志消息键名
+ * @param {boolean} shouldLock 是否锁定（C4：内容过滤与 TRIVIAL 不锁，保留「编辑后重提」出路；
+ *   SPAM/MALICIOUS/黑名单维持锁定 —— 防御性决策，见 conflicts C4 / R4）
  */
-async function closePRWithType(octokit, owner, repo, pr, config, responseKey, logKey) {
+async function closePRWithType(octokit, owner, repo, pr, config, responseKey, logKey, shouldLock = true) {
   await closePR(
     octokit,
     owner,
     repo,
     pr.number,
     config.responses[responseKey],
-    config
+    config,
+    shouldLock
   );
 
   core.info(logMessage(config.logging[logKey], { number: pr.number }));
@@ -151,8 +179,11 @@ async function handleLowQualityPR(octokit, owner, repo, pr, config, reason) {
 
   const responseKey = responseMap[reason] || 'pr_closed';
   const logKey = logMap[reason] || 'pr_closed_log';
+  // TRIVIAL 不锁定：pr_trivial 回应要求作者「确保提供有意义的改进」后重提（C4）；
+  // MALICIOUS 维持锁定（防御性）。
+  const shouldLock = reason !== 'TRIVIAL';
 
-  await closePRWithType(octokit, owner, repo, pr, config, responseKey, logKey);
+  await closePRWithType(octokit, owner, repo, pr, config, responseKey, logKey, shouldLock);
 }
 
 /**
